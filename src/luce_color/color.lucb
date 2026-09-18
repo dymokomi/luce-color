@@ -1,0 +1,122 @@
+## Perceptual color for user interfaces. Base surfaces are chosen by a theme; the
+## hover, active and focus variants are derived here so a palette stays internally
+## consistent — a grayscale theme yields grayscale states, a tinted one stays in
+## family. Work happens in Oklab (Ottosson 2020), where equal steps look equal.
+import math
+
+# mark: Types =================================================================
+
+## Linear-light sRGB, each component nominally in 0..1. This is the GPU color
+## model, so a caller bridges to and from `gpu.Color` with a field-wise copy and
+## no gamma handling of its own.
+pub struct Color:
+    pub var red: f64
+    pub var green: f64
+    pub var blue: f64
+
+## The Oklab perceptual space: lightness `l` in 0..1 with opponent axes `a`
+## (green to red) and `b` (blue to yellow). A neutral gray has `a` and `b` at 0.
+pub struct Oklab:
+    pub var l: f64
+    pub var a: f64
+    pub var b: f64
+
+# mark: Conversion ============================================================
+
+## Linear sRGB to Oklab. The cube roots make lightness perceptually uniform, so
+## later blends and lifts move by amounts the eye reads as even.
+pub func to_oklab(color: Color) -> Oklab:
+    let l = 0.4122214708 * color.red + 0.5363325363 * color.green + 0.0514459929 * color.blue
+    let m = 0.2119034982 * color.red + 0.6806995451 * color.green + 0.1073969566 * color.blue
+    let s = 0.0883024619 * color.red + 0.2817188376 * color.green + 0.6299787005 * color.blue
+    let l_ = math.cbrt(l)
+    let m_ = math.cbrt(m)
+    let s_ = math.cbrt(s)
+    return Oklab(
+        0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+        1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+        0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_)
+
+## Oklab back to linear sRGB, clamped to the displayable 0..1 cube. A derived
+## color may leave the cube; clamping keeps it a valid `gpu.Color` clear value.
+pub func to_color(lab: Oklab) -> Color:
+    let l_ = lab.l + 0.3963377774 * lab.a + 0.2158037573 * lab.b
+    let m_ = lab.l - 0.1055613458 * lab.a - 0.0638541728 * lab.b
+    let s_ = lab.l - 0.0894841775 * lab.a - 1.2914855480 * lab.b
+    let l = l_ * l_ * l_
+    let m = m_ * m_ * m_
+    let s = s_ * s_ * s_
+    return Color(
+        saturate(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+        saturate(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+        saturate(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s))
+
+# mark: Derivation ============================================================
+
+## Move `base` toward `reference` in perceptual lightness only, keeping the base
+## hue and chroma. `amount` 0 returns `base`; 1 adopts the reference lightness.
+## This lifts a surface into a hover or active state without inventing a new hue.
+pub func elevate(base: Color, reference: Color, amount: f64) -> Color:
+    let source = to_oklab(base)
+    let target = to_oklab(reference)
+    return to_color(Oklab(source.l + (target.l - source.l) * amount, source.a, source.b))
+
+## Blend two colors along a straight line in Oklab, so a midpoint stays saturated
+## instead of dipping through a muddy sRGB average. `amount` 0 returns `a`, 1 `b`.
+pub func blend(a: Color, b: Color, amount: f64) -> Color:
+    let first = to_oklab(a)
+    let second = to_oklab(b)
+    return to_color(Oklab(
+        first.l + (second.l - first.l) * amount,
+        first.a + (second.a - first.a) * amount,
+        first.b + (second.b - first.b) * amount))
+
+# mark: Helpers ===============================================================
+
+## Clamp to 0..1, mapping any NaN to 0 through the negated positive test.
+func saturate(value: f64) -> f64:
+    if not (value > 0.0):
+        return 0.0
+    return 1.0 if value > 1.0 else value
+
+# mark: Tests =================================================================
+
+func near(a: f64, b: f64) -> bool:
+    return math.abs(a - b) < 0.0001
+
+func gray(value: f64) -> Color:
+    return Color(value, value, value)
+
+test "linear sRGB survives an Oklab round trip":
+    for sample in [gray(0.0), gray(0.02), gray(0.5), gray(1.0), Color(0.2, 0.66, 0.92), Color(0.55, 0.26, 0.65), Color(0.021, 0.028, 0.041)]:
+        let back = to_color(to_oklab(sample))
+        assert(near(back.red, sample.red) and near(back.green, sample.green) and near(back.blue, sample.blue))
+
+test "a neutral base derives neutral states":
+    let panel = gray(0.03)
+    let foreground = gray(0.7)
+    let hover = elevate(panel, foreground, 0.1)
+    let active = elevate(gray(0.028), foreground, 0.12)
+    assert(near(hover.red, hover.green) and near(hover.green, hover.blue))
+    assert(near(active.red, active.green) and near(active.green, active.blue))
+    assert(hover.red > panel.red and active.red > 0.028)
+
+test "elevate keeps hue and honors its endpoints":
+    let base = Color(0.03, 0.05, 0.09)
+    let reference = Color(0.7, 0.75, 0.82)
+    let unchanged = elevate(base, reference, 0.0)
+    assert(near(unchanged.red, base.red) and near(unchanged.green, base.green) and near(unchanged.blue, base.blue))
+    let lifted = elevate(base, reference, 0.35)
+    assert(lifted.blue > lifted.green and lifted.green > lifted.red)
+    let source = to_oklab(base)
+    let raised = to_oklab(lifted)
+    assert(raised.l > source.l and near(raised.a, source.a) and near(raised.b, source.b))
+
+test "blend returns its endpoints and stays in gamut":
+    let a = Color(0.02, 0.03, 0.05)
+    let b = Color(0.2, 0.66, 0.92)
+    let low = blend(a, b, 0.0)
+    let high = blend(a, b, 1.0)
+    assert(near(low.red, a.red) and near(high.blue, b.blue))
+    let middle = blend(a, b, 0.5)
+    assert(middle.red >= 0.0 and middle.green <= 1.0 and middle.blue <= 1.0)

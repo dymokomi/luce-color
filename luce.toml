@@ -1,0 +1,6 @@
+[package]
+name = "luce_color"
+source = "src"
+
+[exports]
+color = "luce_color.color"
