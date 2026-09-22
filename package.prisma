@@ -1,7 +1,8 @@
 #prisma 4.0
 def package "luce-color" {
     str owner = "dymokomi"
-    str version = "0.1.0"
+    str version = "0.1.1"
+    str kind = "package"
     str language = "luce-base"
     str description = "Perceptual color for user interfaces, written in Luce Base. A theme names a handful of base surfaces; the hover, focus and active-line variants a UI needs are *derived* from them here, so a palette can never fall out of step with itself."
     str readme = "README.md"
