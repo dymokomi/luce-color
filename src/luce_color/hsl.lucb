@@ -1,0 +1,115 @@
+## The artist's cylinders over display-encoded RGB: HSV (hue, saturation,
+## value — Photoshop's HSB) and HSL. Hue is degrees 0..360; the rest 0..1.
+## These are conveniences for pickers, not colour science: two colours a step
+## apart in HSV need not look a step apart.
+import math
+from luce_color.color import Color
+
+# mark: Types =================================================================
+
+pub struct HSV:
+    pub var h: f64
+    pub var s: f64
+    pub var v: f64
+
+pub struct HSL:
+    pub var h: f64
+    pub var s: f64
+    pub var l: f64
+
+# mark: HSV ===================================================================
+
+## Encoded RGB (0..1) to HSV. A grey keeps hue 0.
+pub func to_hsv(color: Color) -> HSV:
+    let top = math.max(color.red, math.max(color.green, color.blue))
+    let bottom = math.min(color.red, math.min(color.green, color.blue))
+    let delta = top - bottom
+    return HSV(hue_of(color, top, delta), 0.0 if top <= 0.0 else delta / top, top)
+
+pub func from_hsv(hsv: HSV) -> Color:
+    let h = wrap(hsv.h) / 60.0
+    let sector = (i64)math.floor(h)
+    let f = h - (f64)sector
+    let p = hsv.v * (1.0 - hsv.s)
+    let q = hsv.v * (1.0 - hsv.s * f)
+    let t = hsv.v * (1.0 - hsv.s * (1.0 - f))
+    if sector == 0:
+        return Color(hsv.v, t, p)
+    if sector == 1:
+        return Color(q, hsv.v, p)
+    if sector == 2:
+        return Color(p, hsv.v, t)
+    if sector == 3:
+        return Color(p, q, hsv.v)
+    if sector == 4:
+        return Color(t, p, hsv.v)
+    return Color(hsv.v, p, q)
+
+# mark: HSL ===================================================================
+
+pub func to_hsl(color: Color) -> HSL:
+    let top = math.max(color.red, math.max(color.green, color.blue))
+    let bottom = math.min(color.red, math.min(color.green, color.blue))
+    let delta = top - bottom
+    let l = (top + bottom) * 0.5
+    let s = 0.0 if delta <= 0.0 or l <= 0.0 or l >= 1.0 else delta / (1.0 - math.abs(2.0 * l - 1.0))
+    return HSL(hue_of(color, top, delta), s, l)
+
+pub func from_hsl(hsl: HSL) -> Color:
+    let c = (1.0 - math.abs(2.0 * hsl.l - 1.0)) * hsl.s
+    let h = wrap(hsl.h) / 60.0
+    let x = c * (1.0 - math.abs(math.mod(h, 2.0) - 1.0))
+    let m = hsl.l - c * 0.5
+    let sector = (i64)math.floor(h)
+    if sector == 0:
+        return Color(c + m, x + m, m)
+    if sector == 1:
+        return Color(x + m, c + m, m)
+    if sector == 2:
+        return Color(m, c + m, x + m)
+    if sector == 3:
+        return Color(m, x + m, c + m)
+    if sector == 4:
+        return Color(x + m, m, c + m)
+    return Color(c + m, m, x + m)
+
+# mark: Helpers ===============================================================
+
+## The hue of a colour given its maximum component and range, 0..360.
+func hue_of(color: Color, top: f64, delta: f64) -> f64:
+    if delta <= 0.0:
+        return 0.0
+    var h = 0.0
+    if top == color.red:
+        h = (color.green - color.blue) / delta
+    elif top == color.green:
+        h = 2.0 + (color.blue - color.red) / delta
+    else:
+        h = 4.0 + (color.red - color.green) / delta
+    return wrap(h * 60.0)
+
+## An angle brought into 0..360.
+pub func wrap(degrees: f64) -> f64:
+    var wrapped = degrees - math.floor(degrees / 360.0) * 360.0
+    if wrapped >= 360.0:
+        wrapped = 0.0
+    return wrapped
+
+# mark: Tests =================================================================
+
+func near(a: f64, b: f64, tolerance: f64 = 0.0001) -> bool:
+    return math.abs(a - b) < tolerance
+
+test "HSV and HSL hit their anchors and round-trip":
+    let red = to_hsv(Color(1.0, 0.0, 0.0))
+    assert(near(red.h, 0.0) and near(red.s, 1.0) and near(red.v, 1.0))
+    let blue = to_hsl(Color(0.0, 0.0, 1.0))
+    assert(near(blue.h, 240.0) and near(blue.s, 1.0) and near(blue.l, 0.5))
+    let grey = to_hsv(Color(0.5, 0.5, 0.5))
+    assert(near(grey.h, 0.0) and near(grey.s, 0.0) and near(grey.v, 0.5))
+    for sample in [Color(0.906, 0.627, 0.247), Color(0.2, 0.66, 0.92), Color(0.0, 0.0, 0.0), Color(1.0, 1.0, 1.0), Color(0.3, 0.1, 0.7)]:
+        let via_hsv = from_hsv(to_hsv(sample))
+        let via_hsl = from_hsl(to_hsl(sample))
+        assert(near(via_hsv.red, sample.red) and near(via_hsv.green, sample.green) and near(via_hsv.blue, sample.blue))
+        assert(near(via_hsl.red, sample.red) and near(via_hsl.green, sample.green) and near(via_hsl.blue, sample.blue))
+    assert(near(wrap(-30.0), 330.0) and near(wrap(720.0), 0.0))

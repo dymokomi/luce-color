@@ -1,16 +1,41 @@
 # luce-color
 
-Perceptual color for user interfaces, written in Luce Base. A theme names a
-handful of base surfaces; the hover, focus and active-line variants a UI needs
-are *derived* from them here, so a palette can never fall out of step with
-itself. A grayscale palette yields grayscale states; a tinted one stays in its
-own hue family.
+Colour science for Luce, written in Luce Base. Everything that turns numbers
+into colours and colours into what the eye sees lives here, so an editor, a
+UI theme and a file codec agree about what a colour is:
 
-Work happens in [Oklab](https://bottosson.github.io/posts/oklab/), where equal
-numeric steps look like equal steps to the eye, so a lift or a blend lands where
-you expect regardless of the starting color.
+| module | what it holds |
+| --- | --- |
+| `color` | `Color` (linear sRGB, the GPU model), Oklab, and the surface derivations luce-ui themes use (`elevate`, `blend`) |
+| `transfer` | transfer functions: sRGB, gamma 1.8/2.2/2.4, PQ (ST 2084), HLG; `encode`/`decode` by `Transfer` |
+| `xyz` | CIE XYZ, chromaticities and whites (D65, D50, ACES), `Primaries` for sRGB, Display P3, Adobe RGB, Rec. 2020, ACES AP0/AP1, ProPhoto; matrices *derived* from chromaticities; Bradford adaptation; `convert` between primaries |
+| `lab` | CIELAB and LCh against any white, ΔE76 and CIEDE2000, OkLCh |
+| `cam16` | CAM16 viewing conditions, appearance (J, Q, C, M, s, h), the inverse from JCh, CAM16-UCS and its ΔE |
+| `hsl` | HSV (Photoshop's HSB) and HSL over encoded RGB, for pickers |
+| `space` | `ColorSpace` = name + primaries + transfer, as OpenColorIO models one; a catalogue (`space.all`, `space.named`); `convert(color, from, to)` — decode, matrix, adapt, matrix, encode — plus `to_lab`, `to_oklab_in`, `to_appearance`, `in_gamut`, `clamp` |
 
-## Model
+```luce
+import space
+import lab
+import cam16
+
+# Display P3's red, as sRGB sees it: out of gamut, so clamp for a preview.
+let red = space.convert(color.Color(1.0, 0.0, 0.0), space.display_p3, space.srgb)
+let shown = space.clamp(red)
+
+# How different are two paints? CIEDE2000 about 1 is a just-noticeable step.
+let difference = lab.delta_e2000(space.to_lab(a, space.srgb), space.to_lab(b, space.srgb))
+
+# What a colour looks like on this display: CAM16 lightness, chroma and hue.
+let look = space.to_appearance(a, space.srgb, space.display_viewing(space.srgb))
+```
+
+Numbers are checked against the published references in each module's tests:
+the sRGB matrix, ST 2084's luminance anchors, Sharma's CIEDE2000 pairs, CAM16's
+white and inverse. An OCIO config reader is not here yet; `space.convert` is the
+processor chain one would produce for a pair of its colour spaces.
+
+## Theme derivations (`color`)
 
 `Color` is a linear-light sRGB triple — the same model as `gpu.Color` — so a
 caller bridges with a field-wise copy and no gamma handling of its own. `Oklab`

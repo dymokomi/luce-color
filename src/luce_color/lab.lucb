@@ -1,0 +1,147 @@
+## CIELAB and its polar form, the colour differences built on them, and the
+## polar form of Oklab. Lab needs a white: pass the one the XYZ is relative to.
+import math
+from luce_color.color import Oklab
+from luce_color.xyz import XYZ, Chromaticity, white_point, d65
+
+# mark: Types =================================================================
+
+## CIE L*a*b*: lightness 0..100, a (green−red) and b (blue−yellow) about ±128.
+pub struct Lab:
+    pub var l: f64
+    pub var a: f64
+    pub var b: f64
+
+## The polar form: lightness, chroma, hue in degrees 0..360.
+pub struct LCh:
+    pub var l: f64
+    pub var c: f64
+    pub var h: f64
+
+# mark: CIELAB ================================================================
+
+## XYZ (white at Y = 1) to L*a*b* against `white`.
+pub func xyz_to_lab(value: XYZ, white: Chromaticity = d65) -> Lab:
+    let reference = white_point(white)
+    let fx = lab_f(value.x / reference.x)
+    let fy = lab_f(value.y / reference.y)
+    let fz = lab_f(value.z / reference.z)
+    return Lab(116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+
+pub func lab_to_xyz(lab: Lab, white: Chromaticity = d65) -> XYZ:
+    let reference = white_point(white)
+    let fy = (lab.l + 16.0) / 116.0
+    let fx = fy + lab.a / 500.0
+    let fz = fy - lab.b / 200.0
+    return XYZ(lab_f_inverse(fx) * reference.x, lab_f_inverse(fy) * reference.y, lab_f_inverse(fz) * reference.z)
+
+let lab_epsilon: f64 = 216.0 / 24389.0
+let lab_kappa: f64 = 24389.0 / 27.0
+
+func lab_f(t: f64) -> f64:
+    return math.cbrt(t) if t > lab_epsilon else (lab_kappa * t + 16.0) / 116.0
+
+func lab_f_inverse(f: f64) -> f64:
+    let cube = f * f * f
+    return cube if cube > lab_epsilon else (116.0 * f - 16.0) / lab_kappa
+
+# mark: Polar =================================================================
+
+pub func lab_to_lch(lab: Lab) -> LCh:
+    return LCh(lab.l, math.hypot(lab.a, lab.b), hue_degrees(lab.a, lab.b))
+
+pub func lch_to_lab(lch: LCh) -> Lab:
+    let radians = lch.h * math.pi / 180.0
+    return Lab(lch.l, lch.c * math.cos(radians), lch.c * math.sin(radians))
+
+## Oklab in polar form: lightness 0..1, chroma, hue in degrees.
+pub func oklab_to_oklch(lab: Oklab) -> LCh:
+    return LCh(lab.l, math.hypot(lab.a, lab.b), hue_degrees(lab.a, lab.b))
+
+pub func oklch_to_oklab(lch: LCh) -> Oklab:
+    let radians = lch.h * math.pi / 180.0
+    return Oklab(lch.l, lch.c * math.cos(radians), lch.c * math.sin(radians))
+
+## The hue angle of an opponent pair, 0..360.
+pub func hue_degrees(a: f64, b: f64) -> f64:
+    var degrees = math.atan2(b, a) * 180.0 / math.pi
+    if degrees < 0.0:
+        degrees += 360.0
+    return degrees
+
+# mark: Differences ===========================================================
+
+## CIE 1976 ΔE: the Euclidean distance.
+pub func delta_e76(a: Lab, b: Lab) -> f64:
+    return math.sqrt((a.l - b.l) * (a.l - b.l) + (a.a - b.a) * (a.a - b.a) + (a.b - b.b) * (a.b - b.b))
+
+## CIEDE2000 (Sharma, Wu & Dalal 2005 formulation), with the usual unit
+## parametric weights. About 1.0 is a just-noticeable difference.
+pub func delta_e2000(first: Lab, second: Lab) -> f64:
+    let c1 = math.hypot(first.a, first.b)
+    let c2 = math.hypot(second.a, second.b)
+    let mean_c = (c1 + c2) * 0.5
+    let c7 = math.pow(mean_c, 7.0)
+    let g = 0.5 * (1.0 - math.sqrt(c7 / (c7 + 6103515625.0)))
+    let a1 = first.a * (1.0 + g)
+    let a2 = second.a * (1.0 + g)
+    let c1p = math.hypot(a1, first.b)
+    let c2p = math.hypot(a2, second.b)
+    let h1p = 0.0 if a1 == 0.0 and first.b == 0.0 else hue_degrees(a1, first.b)
+    let h2p = 0.0 if a2 == 0.0 and second.b == 0.0 else hue_degrees(a2, second.b)
+    let dl = second.l - first.l
+    let dc = c2p - c1p
+    var dh = 0.0
+    if c1p * c2p != 0.0:
+        dh = h2p - h1p
+        if dh > 180.0:
+            dh -= 360.0
+        elif dh < -180.0:
+            dh += 360.0
+    let dH = 2.0 * math.sqrt(c1p * c2p) * math.sin(dh * 0.5 * math.pi / 180.0)
+    let mean_l = (first.l + second.l) * 0.5
+    let mean_cp = (c1p + c2p) * 0.5
+    var mean_h = h1p + h2p
+    if c1p * c2p != 0.0:
+        if math.abs(h1p - h2p) > 180.0:
+            mean_h += 360.0 if h1p + h2p < 360.0 else -360.0
+        mean_h *= 0.5
+    let radians = mean_h * math.pi / 180.0
+    let t = 1.0 - 0.17 * math.cos(radians - 30.0 * math.pi / 180.0) + 0.24 * math.cos(2.0 * radians) + 0.32 * math.cos(3.0 * radians + 6.0 * math.pi / 180.0) - 0.20 * math.cos(4.0 * radians - 63.0 * math.pi / 180.0)
+    let l50 = (mean_l - 50.0) * (mean_l - 50.0)
+    let sl = 1.0 + 0.015 * l50 / math.sqrt(20.0 + l50)
+    let sc = 1.0 + 0.045 * mean_cp
+    let sh = 1.0 + 0.015 * mean_cp * t
+    let theta = 30.0 * math.exp(-((mean_h - 275.0) / 25.0) * ((mean_h - 275.0) / 25.0))
+    let cp7 = math.pow(mean_cp, 7.0)
+    let rc = 2.0 * math.sqrt(cp7 / (cp7 + 6103515625.0))
+    let rt = -math.sin(2.0 * theta * math.pi / 180.0) * rc
+    let tl = dl / sl
+    let tc = dc / sc
+    let th = dH / sh
+    return math.sqrt(tl * tl + tc * tc + th * th + rt * tc * th)
+
+# mark: Tests =================================================================
+
+func near(a: f64, b: f64, tolerance: f64 = 0.0001) -> bool:
+    return math.abs(a - b) < tolerance
+
+test "Lab anchors: white is L 100, black L 0, and XYZ round-trips":
+    let white = xyz_to_lab(white_point(d65))
+    assert(near(white.l, 100.0) and near(white.a, 0.0) and near(white.b, 0.0))
+    let black = xyz_to_lab(XYZ(0.0, 0.0, 0.0))
+    assert(near(black.l, 0.0))
+    let sample = XYZ(0.3, 0.4, 0.2)
+    let back = lab_to_xyz(xyz_to_lab(sample))
+    assert(near(back.x, sample.x) and near(back.y, sample.y) and near(back.z, sample.z))
+    let lch = lab_to_lch(Lab(50.0, -30.0, 40.0))
+    assert(near(lch.c, 50.0) and near(lch.h, 126.8699))
+    let lab = lch_to_lab(lch)
+    assert(near(lab.a, -30.0) and near(lab.b, 40.0))
+
+test "CIEDE2000 reproduces Sharma's published pairs":
+    # Pairs 1, 7 and 17 of the 2005 test data.
+    assert(near(delta_e2000(Lab(50.0, 2.6772, -79.7751), Lab(50.0, 0.0, -82.7485)), 2.0425, 0.0001))
+    assert(near(delta_e2000(Lab(50.0, 0.0, 0.0), Lab(50.0, -1.0, 2.0)), 2.3669, 0.0001))
+    assert(near(delta_e2000(Lab(50.0, 2.5, 0.0), Lab(50.0, 3.1736, 0.5854)), 1.0, 0.0001))
+    assert(near(delta_e76(Lab(50.0, 0.0, 0.0), Lab(50.0, 3.0, 4.0)), 5.0))

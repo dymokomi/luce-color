@@ -1,0 +1,187 @@
+## CIE XYZ, the hub every colour space meets at, and the RGB spaces defined on
+## it by their primaries and white: matrices are derived from chromaticities,
+## never typed in, and whites are reconciled by Bradford adaptation.
+import math
+from luce_color.color import Color
+
+# mark: Types =================================================================
+
+## CIE 1931 tristimulus values. Y is luminance; the library keeps white at Y = 1
+## except where a model (CAM16) asks for Y = 100.
+pub struct XYZ:
+    pub var x: f64
+    pub var y: f64
+    pub var z: f64
+
+## A CIE xy chromaticity.
+pub struct Chromaticity:
+    pub var x: f64
+    pub var y: f64
+
+## A 3×3 matrix, row-major.
+pub struct Matrix3:
+    pub var m: f64[9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+
+## An RGB space's colorimetry: the three primaries and the white they mix to.
+pub struct Primaries:
+    pub var red: Chromaticity
+    pub var green: Chromaticity
+    pub var blue: Chromaticity
+    pub var white: Chromaticity
+
+# mark: Whites ================================================================
+
+pub let d65: Chromaticity = Chromaticity(0.3127, 0.3290)
+pub let d50: Chromaticity = Chromaticity(0.3457, 0.3585)
+## ACES's white, near D60.
+pub let aces_white: Chromaticity = Chromaticity(0.32168, 0.33767)
+## Equal energy.
+pub let illuminant_e: Chromaticity = Chromaticity(1.0 / 3.0, 1.0 / 3.0)
+
+## The XYZ of a chromaticity at Y = 1.
+pub func white_point(white: Chromaticity) -> XYZ:
+    return XYZ(white.x / white.y, 1.0, (1.0 - white.x - white.y) / white.y)
+
+# mark: Spaces ================================================================
+
+## Rec. 709 / sRGB primaries, D65.
+pub let srgb: Primaries = Primaries(Chromaticity(0.64, 0.33), Chromaticity(0.30, 0.60), Chromaticity(0.15, 0.06), d65)
+## DCI-P3 primaries with a D65 white: Apple's Display P3.
+pub let display_p3: Primaries = Primaries(Chromaticity(0.680, 0.320), Chromaticity(0.265, 0.690), Chromaticity(0.150, 0.060), d65)
+pub let adobe_rgb: Primaries = Primaries(Chromaticity(0.64, 0.33), Chromaticity(0.21, 0.71), Chromaticity(0.15, 0.06), d65)
+pub let rec2020: Primaries = Primaries(Chromaticity(0.708, 0.292), Chromaticity(0.170, 0.797), Chromaticity(0.131, 0.046), d65)
+## ACES2065-1's AP0: the whole spectral locus and beyond.
+pub let aces_ap0: Primaries = Primaries(Chromaticity(0.7347, 0.2653), Chromaticity(0.0, 1.0), Chromaticity(0.0001, -0.0770), aces_white)
+## ACEScg's AP1.
+pub let aces_ap1: Primaries = Primaries(Chromaticity(0.713, 0.293), Chromaticity(0.165, 0.830), Chromaticity(0.128, 0.044), aces_white)
+## ProPhoto / ROMM RGB, D50.
+pub let prophoto: Primaries = Primaries(Chromaticity(0.7347, 0.2653), Chromaticity(0.1596, 0.8404), Chromaticity(0.0366, 0.0001), d50)
+
+# mark: Matrices ==============================================================
+
+pub func multiply(a: Matrix3, b: Matrix3) -> Matrix3:
+    var out = Matrix3()
+    for row in 0..<(usize)3:
+        for column in 0..<(usize)3:
+            var sum = 0.0
+            for k in 0..<(usize)3:
+                sum += a.m[row * 3 + k] * b.m[k * 3 + column]
+            out.m[row * 3 + column] = sum
+    return out
+
+## `matrix` applied to a column vector.
+pub func apply(matrix: Matrix3, v: XYZ) -> XYZ:
+    return XYZ(matrix.m[0] * v.x + matrix.m[1] * v.y + matrix.m[2] * v.z,
+               matrix.m[3] * v.x + matrix.m[4] * v.y + matrix.m[5] * v.z,
+               matrix.m[6] * v.x + matrix.m[7] * v.y + matrix.m[8] * v.z)
+
+## The inverse; a singular matrix returns the identity, which no real set of
+## primaries produces.
+pub func invert(a: Matrix3) -> Matrix3:
+    let m = a.m
+    let c0 = m[4] * m[8] - m[5] * m[7]
+    let c1 = m[5] * m[6] - m[3] * m[8]
+    let c2 = m[3] * m[7] - m[4] * m[6]
+    let determinant = m[0] * c0 + m[1] * c1 + m[2] * c2
+    if math.abs(determinant) < 1.0e-15:
+        return Matrix3()
+    let d = 1.0 / determinant
+    var out = Matrix3()
+    out.m[0] = c0 * d
+    out.m[1] = (m[2] * m[7] - m[1] * m[8]) * d
+    out.m[2] = (m[1] * m[5] - m[2] * m[4]) * d
+    out.m[3] = c1 * d
+    out.m[4] = (m[0] * m[8] - m[2] * m[6]) * d
+    out.m[5] = (m[2] * m[3] - m[0] * m[5]) * d
+    out.m[6] = c2 * d
+    out.m[7] = (m[1] * m[6] - m[0] * m[7]) * d
+    out.m[8] = (m[0] * m[4] - m[1] * m[3]) * d
+    return out
+
+## The matrix taking linear RGB in `primaries` to XYZ (white at Y = 1): the
+## primaries' XYZ columns, scaled so that RGB (1, 1, 1) lands on the white.
+pub func rgb_to_xyz(primaries: Primaries) -> Matrix3:
+    let r = white_point(primaries.red)
+    let g = white_point(primaries.green)
+    let b = white_point(primaries.blue)
+    var columns = Matrix3()
+    columns.m = [r.x, g.x, b.x, r.y, g.y, b.y, r.z, g.z, b.z]
+    let scale = apply(invert(columns), white_point(primaries.white))
+    var out = columns
+    out.m[0] *= scale.x
+    out.m[3] *= scale.x
+    out.m[6] *= scale.x
+    out.m[1] *= scale.y
+    out.m[4] *= scale.y
+    out.m[7] *= scale.y
+    out.m[2] *= scale.z
+    out.m[5] *= scale.z
+    out.m[8] *= scale.z
+    return out
+
+pub func xyz_to_rgb(primaries: Primaries) -> Matrix3:
+    return invert(rgb_to_xyz(primaries))
+
+# mark: Adaptation ============================================================
+
+## The Bradford chromatic adaptation from one white to another, so a colour
+## keeps its appearance when the spaces disagree about white (sRGB's D65 against
+## ProPhoto's D50, say). Equal whites give the identity.
+pub func adapt(source: Chromaticity, target: Chromaticity) -> Matrix3:
+    if math.abs(source.x - target.x) < 1.0e-9 and math.abs(source.y - target.y) < 1.0e-9:
+        return Matrix3()
+    let cone_source = apply(bradford, white_point(source))
+    let cone_target = apply(bradford, white_point(target))
+    var scale = Matrix3()
+    scale.m = [cone_target.x / cone_source.x, 0.0, 0.0, 0.0, cone_target.y / cone_source.y, 0.0, 0.0, 0.0, cone_target.z / cone_source.z]
+    return multiply(invert(bradford), multiply(scale, bradford))
+
+let bradford: Matrix3 = Matrix3([0.8951, 0.2664, -0.1614, -0.7502, 1.7135, 0.0367, 0.0389, -0.0685, 1.0296])
+
+# mark: Conversion ============================================================
+
+## Linear RGB in `primaries` to XYZ, in the primaries' own white.
+pub func to_xyz(color: Color, primaries: Primaries) -> XYZ:
+    return apply(rgb_to_xyz(primaries), XYZ(color.red, color.green, color.blue))
+
+## XYZ (in the primaries' white) to linear RGB, unclamped: a colour outside
+## the gamut shows as a component outside 0..1.
+pub func from_xyz(value: XYZ, primaries: Primaries) -> Color:
+    let rgb = apply(xyz_to_rgb(primaries), value)
+    return Color(rgb.x, rgb.y, rgb.z)
+
+## Linear RGB from one set of primaries to another, adapting between whites.
+pub func convert(color: Color, source: Primaries, target: Primaries) -> Color:
+    let value = to_xyz(color, source)
+    return from_xyz(apply(adapt(source.white, target.white), value), target)
+
+# mark: Tests =================================================================
+
+func near(a: f64, b: f64, tolerance: f64 = 0.0001) -> bool:
+    return math.abs(a - b) < tolerance
+
+test "sRGB's derived matrix matches the published one":
+    let m = rgb_to_xyz(srgb)
+    assert(near(m.m[0], 0.4124, 0.0005) and near(m.m[1], 0.3576, 0.0005) and near(m.m[2], 0.1805, 0.0005))
+    assert(near(m.m[3], 0.2126, 0.0005) and near(m.m[4], 0.7152, 0.0005) and near(m.m[5], 0.0722, 0.0005))
+    assert(near(m.m[6], 0.0193, 0.0005) and near(m.m[7], 0.1192, 0.0005) and near(m.m[8], 0.9505, 0.0005))
+    let white = to_xyz(Color(1.0, 1.0, 1.0), srgb)
+    assert(near(white.x, 0.9505, 0.0005) and near(white.y, 1.0) and near(white.z, 1.0888, 0.0005))
+
+test "a matrix inverts and a colour round-trips through XYZ":
+    let identity = multiply(rgb_to_xyz(rec2020), xyz_to_rgb(rec2020))
+    for index in 0..<(usize)9:
+        assert(near(identity.m[index], 1.0 if index % 4 == 0 else 0.0, 0.000001))
+    let sample = Color(0.2, 0.66, 0.92)
+    let back = from_xyz(to_xyz(sample, display_p3), display_p3)
+    assert(near(back.red, sample.red) and near(back.green, sample.green) and near(back.blue, sample.blue))
+
+test "conversion widens into P3 and adaptation moves white to white":
+    let red = convert(Color(1.0, 0.0, 0.0), srgb, display_p3)
+    # Linear: sRGB red is (0.8225, 0.0332, 0.0171) in P3.
+    assert(near(red.red, 0.8225, 0.001) and near(red.green, 0.0332, 0.001) and near(red.blue, 0.0171, 0.001))
+    let white = convert(Color(1.0, 1.0, 1.0), srgb, prophoto)
+    assert(near(white.red, 1.0, 0.001) and near(white.green, 1.0, 0.001) and near(white.blue, 1.0, 0.001))
+    let d50_white = apply(adapt(d65, d50), white_point(d65))
+    let expected = white_point(d50)
+    assert(near(d50_white.x, expected.x, 0.001) and near(d50_white.y, expected.y, 0.001) and near(d50_white.z, expected.z, 0.001))

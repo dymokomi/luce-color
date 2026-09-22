@@ -1,13 +1,37 @@
 #prisma 4.0
 def package "luce-color" {
     str owner = "dymokomi"
-    str version = "0.1.3"
+    str version = "0.2.0"
     str kind = "package"
     str language = "luce-base"
-    str description = "Perceptual color for user interfaces, written in Luce Base. A theme names a handful of base surfaces; the hover, focus and active-line variants a UI needs are *derived* from them here, so a palette can never fall out of step with itself."
+    str description = "Colour science in Luce Base: XYZ with derived matrices and Bradford adaptation, sRGB/P3/Adobe/Rec.2020/ACES/ProPhoto spaces, sRGB/gamma/PQ/HLG curves, CIELAB with CIEDE2000, Oklab, CAM16 and CAM16-UCS, HSV/HSL, OCIO-style conversion."
     str readme = "README.md"
 
     def export "color" {
         str module = "luce_color.color"
+    }
+
+    def export "transfer" {
+        str module = "luce_color.transfer"
+    }
+
+    def export "xyz" {
+        str module = "luce_color.xyz"
+    }
+
+    def export "lab" {
+        str module = "luce_color.lab"
+    }
+
+    def export "cam16" {
+        str module = "luce_color.cam16"
+    }
+
+    def export "hsl" {
+        str module = "luce_color.hsl"
+    }
+
+    def export "space" {
+        str module = "luce_color.space"
     }
 }

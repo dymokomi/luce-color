@@ -1,0 +1,122 @@
+## Colour spaces the way OpenColorIO thinks of them: a name, a set of primaries
+## with a white, and a transfer function. `convert` is the processor chain OCIO
+## would build for a pair of them — decode, matrix, adapt, matrix, encode —
+## and `to_lab`/`to_appearance` take any space to the perceptual models.
+import math
+from luce_color.color import Color, Oklab, to_oklab
+import luce_color.transfer as transfer
+import luce_color.xyz as xyz
+import luce_color.lab as lab
+import luce_color.cam16 as cam16
+
+# mark: Types =================================================================
+
+pub struct ColorSpace:
+    pub var name: str
+    pub var primaries: xyz.Primaries
+    pub var transfer: transfer.Transfer
+
+# mark: Catalogue =============================================================
+
+pub let srgb: ColorSpace = ColorSpace("sRGB", xyz.srgb, transfer.Transfer.srgb)
+pub let linear_srgb: ColorSpace = ColorSpace("Linear sRGB", xyz.srgb, transfer.Transfer.linear)
+pub let display_p3: ColorSpace = ColorSpace("Display P3", xyz.display_p3, transfer.Transfer.srgb)
+pub let adobe_rgb: ColorSpace = ColorSpace("Adobe RGB (1998)", xyz.adobe_rgb, transfer.Transfer.gamma_22)
+pub let rec2020: ColorSpace = ColorSpace("Rec. 2020", xyz.rec2020, transfer.Transfer.gamma_24)
+pub let rec2100_pq: ColorSpace = ColorSpace("Rec. 2100 PQ", xyz.rec2020, transfer.Transfer.pq)
+pub let rec2100_hlg: ColorSpace = ColorSpace("Rec. 2100 HLG", xyz.rec2020, transfer.Transfer.hlg)
+pub let acescg: ColorSpace = ColorSpace("ACEScg", xyz.aces_ap1, transfer.Transfer.linear)
+pub let aces2065: ColorSpace = ColorSpace("ACES2065-1", xyz.aces_ap0, transfer.Transfer.linear)
+pub let prophoto: ColorSpace = ColorSpace("ProPhoto RGB", xyz.prophoto, transfer.Transfer.gamma_18)
+
+## Every space above, for menus.
+pub let all: ColorSpace[10] = [srgb, linear_srgb, display_p3, adobe_rgb, rec2020, rec2100_pq, rec2100_hlg, acescg, aces2065, prophoto]
+
+## The space called `name`, exactly as the catalogue spells it.
+pub func named(name: str) -> ColorSpace?:
+    for space in all:
+        if space.name == name:
+            return space
+    return none
+
+# mark: Processing ============================================================
+
+## Encoded to linear in the same primaries.
+pub func decode(color: Color, space: ColorSpace) -> Color:
+    return Color(transfer.decode(color.red, space.transfer), transfer.decode(color.green, space.transfer), transfer.decode(color.blue, space.transfer))
+
+pub func encode(color: Color, space: ColorSpace) -> Color:
+    return Color(transfer.encode(color.red, space.transfer), transfer.encode(color.green, space.transfer), transfer.encode(color.blue, space.transfer))
+
+## An encoded colour in `source` as an encoded colour in `target`, unclamped; see
+## `in_gamut` and `clamp`.
+pub func convert(color: Color, source: ColorSpace, target: ColorSpace) -> Color:
+    return encode(xyz.convert(decode(color, source), source.primaries, target.primaries), target)
+
+## The XYZ (white at Y = 1, in the space's own white) of an encoded colour.
+pub func to_xyz(color: Color, space: ColorSpace) -> xyz.XYZ:
+    return xyz.to_xyz(decode(color, space), space.primaries)
+
+pub func from_xyz(value: xyz.XYZ, space: ColorSpace) -> Color:
+    return encode(xyz.from_xyz(value, space.primaries), space)
+
+## CIELAB against the space's white.
+pub func to_lab(color: Color, space: ColorSpace) -> lab.Lab:
+    return lab.xyz_to_lab(to_xyz(color, space), space.primaries.white)
+
+pub func from_lab(value: lab.Lab, space: ColorSpace) -> Color:
+    return from_xyz(lab.lab_to_xyz(value, space.primaries.white), space)
+
+## Oklab, which is defined on D65: other whites are adapted first.
+pub func to_oklab_in(color: Color, space: ColorSpace) -> Oklab:
+    return to_oklab(xyz.convert(decode(color, space), space.primaries, xyz.srgb))
+
+## CAM16 appearance under `viewing`, whose white should be the space's at Y = 100.
+pub func to_appearance(color: Color, space: ColorSpace, viewing: cam16.Viewing) -> cam16.Appearance:
+    let value = to_xyz(color, space)
+    return cam16.appearance(xyz.XYZ(value.x * 100.0, value.y * 100.0, value.z * 100.0), viewing)
+
+## Viewing conditions for a display showing `space`, at its white.
+pub func display_viewing(space: ColorSpace, adapting_luminance: f64 = 40.0) -> cam16.Viewing:
+    let white = xyz.white_point(space.primaries.white)
+    return cam16.viewing(xyz.XYZ(white.x * 100.0, white.y * 100.0, white.z * 100.0), adapting_luminance)
+
+# mark: Gamut =================================================================
+
+## Whether every component lies in 0..1, within a hair.
+pub func in_gamut(color: Color, tolerance: f64 = 0.0005) -> bool:
+    return color.red >= -tolerance and color.red <= 1.0 + tolerance and color.green >= -tolerance and color.green <= 1.0 + tolerance and color.blue >= -tolerance and color.blue <= 1.0 + tolerance
+
+## Each component clamped to 0..1: the crude gamut map, fine for previews.
+pub func clamp(color: Color) -> Color:
+    return Color(math.clamp(color.red, 0.0, 1.0), math.clamp(color.green, 0.0, 1.0), math.clamp(color.blue, 0.0, 1.0))
+
+# mark: Tests =================================================================
+
+func near(a: f64, b: f64, tolerance: f64 = 0.001) -> bool:
+    return math.abs(a - b) < tolerance
+
+test "conversions round-trip and known pairs hold":
+    let orange = Color(0.906, 0.627, 0.247)
+    for space in all:
+        let there = convert(orange, srgb, space)
+        let back = convert(there, space, srgb)
+        assert(near(back.red, orange.red) and near(back.green, orange.green) and near(back.blue, orange.blue))
+    let p3 = convert(Color(1.0, 0.0, 0.0), srgb, display_p3)
+    assert(near(p3.red, 0.9175, 0.002) and near(p3.green, 0.2003, 0.002) and near(p3.blue, 0.1386, 0.002))
+    assert(in_gamut(p3) and not in_gamut(convert(Color(1.0, 0.0, 0.0), display_p3, srgb)))
+    let white = convert(Color(1.0, 1.0, 1.0), srgb, prophoto)
+    assert(near(white.red, 1.0) and near(white.green, 1.0) and near(white.blue, 1.0))
+
+test "Lab, Oklab and CAM16 read an sRGB colour sensibly":
+    let grey = to_lab(Color(0.5, 0.5, 0.5), srgb)
+    assert(near(grey.l, 53.39, 0.05) and near(grey.a, 0.0, 0.01) and near(grey.b, 0.0, 0.01))
+    let ok = to_oklab_in(Color(1.0, 1.0, 1.0), srgb)
+    assert(near(ok.l, 1.0, 0.001) and near(ok.a, 0.0, 0.001) and near(ok.b, 0.0, 0.001))
+    let look = to_appearance(Color(1.0, 0.0, 0.0), srgb, display_viewing(srgb))
+    assert(look.h > 20.0 and look.h < 40.0 and look.c > 80.0)
+    if let found = named("Display P3"):
+        assert(found.primaries.red.x == 0.68)
+    else:
+        assert(false)
+    assert(named("CMYK") == none)

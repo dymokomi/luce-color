@@ -1,0 +1,186 @@
+## CAM16 (Li et al. 2017): what a colour looks like under given viewing
+## conditions — lightness J, chroma C, hue h, colourfulness M, saturation s,
+## brightness Q — and CAM16-UCS, the uniform space built on it, whose Euclidean
+## distance is a colour difference. XYZ here is on the Y = 100 scale.
+import math
+from luce_color.xyz import XYZ, Matrix3, apply, invert
+
+# mark: Types =================================================================
+
+## The viewing conditions, with everything the model precomputes from them.
+pub struct Viewing:
+    pub var white: XYZ
+    pub var adapting_luminance: f64
+    pub var background: f64
+    pub var surround: f64
+    var n: f64 = 0.0
+    var z: f64 = 0.0
+    var nbb: f64 = 0.0
+    var ncb: f64 = 0.0
+    var c: f64 = 0.0
+    var nc: f64 = 0.0
+    var fl: f64 = 0.0
+    var aw: f64 = 0.0
+    var rgb_d: XYZ = XYZ(1.0, 1.0, 1.0)
+
+## A colour's appearance under some viewing conditions.
+pub struct Appearance:
+    pub var j: f64
+    pub var q: f64
+    pub var c: f64
+    pub var m: f64
+    pub var s: f64
+    pub var h: f64
+
+## CAM16-UCS coordinates: J′ and the opponent pair a′, b′.
+pub struct UCS:
+    pub var j: f64
+    pub var a: f64
+    pub var b: f64
+
+# mark: Viewing conditions ====================================================
+
+## Conditions for a display: `white` at Y = 100 (D65 by default), the
+## adapting field's luminance in cd/m² (a lit office is around 40; a dim room
+## 11.7, sRGB's reference), the background's relative luminance out of 100
+## (20 is the usual grey), and the surround: 2 average, 1 dim, 0 dark.
+pub func viewing(white: XYZ = XYZ(95.047, 100.0, 108.883), adapting_luminance: f64 = 40.0, background: f64 = 20.0, surround: f64 = 2.0) -> Viewing:
+    var v = Viewing(white = white, adapting_luminance = adapting_luminance, background = background, surround = surround)
+    let rgb_w = apply(m16, white)
+    let f = 0.8 + math.clamp(surround, 0.0, 2.0) / 10.0
+    v.c = lerp(0.59, 0.69, (f - 0.9) * 10.0) if f >= 0.9 else lerp(0.525, 0.59, (f - 0.8) * 10.0)
+    v.nc = f
+    let d = math.clamp(f * (1.0 - (1.0 / 3.6) * math.exp((-adapting_luminance - 42.0) / 92.0)), 0.0, 1.0)
+    v.rgb_d = XYZ(d * (100.0 / rgb_w.x) + 1.0 - d, d * (100.0 / rgb_w.y) + 1.0 - d, d * (100.0 / rgb_w.z) + 1.0 - d)
+    let k = 1.0 / (5.0 * adapting_luminance + 1.0)
+    let k4 = k * k * k * k
+    v.fl = k4 * adapting_luminance + 0.1 * (1.0 - k4) * (1.0 - k4) * math.cbrt(5.0 * adapting_luminance)
+    v.n = background / white.y
+    v.z = 1.48 + math.sqrt(v.n)
+    v.nbb = 0.725 / math.pow(v.n, 0.2)
+    v.ncb = v.nbb
+    let adapted = XYZ(adapt_response(v.fl * v.rgb_d.x * rgb_w.x / 100.0), adapt_response(v.fl * v.rgb_d.y * rgb_w.y / 100.0), adapt_response(v.fl * v.rgb_d.z * rgb_w.z / 100.0))
+    v.aw = (2.0 * adapted.x + adapted.y + 0.05 * adapted.z) * v.nbb
+    return v
+
+func lerp(a: f64, b: f64, t: f64) -> f64:
+    return a + (b - a) * t
+
+## The post-adaptation cone response compression, sign-preserving.
+func adapt_response(value: f64) -> f64:
+    let magnitude = math.pow(math.abs(value), 0.42)
+    return math.copysign(400.0 * magnitude / (magnitude + 27.13), value)
+
+let m16: Matrix3 = Matrix3([0.401288, 0.650173, -0.051461, -0.250268, 1.204414, 0.045854, -0.002079, 0.048952, 0.953127])
+
+# mark: Forward ===============================================================
+
+## The appearance of `xyz` (Y = 100 scale) under `v`.
+pub func appearance(xyz: XYZ, v: Viewing) -> Appearance:
+    let rgb = apply(m16, xyz)
+    let ra = adapt_response(v.fl * v.rgb_d.x * rgb.x / 100.0)
+    let ga = adapt_response(v.fl * v.rgb_d.y * rgb.y / 100.0)
+    let ba = adapt_response(v.fl * v.rgb_d.z * rgb.z / 100.0)
+    let a = ra + (-12.0 * ga + ba) / 11.0
+    let b = (ra + ga - 2.0 * ba) / 9.0
+    let u = (20.0 * ra + 20.0 * ga + 21.0 * ba) / 20.0
+    let p2 = (40.0 * ra + 20.0 * ga + ba) / 20.0
+    var h = math.atan2(b, a) * 180.0 / math.pi
+    if h < 0.0:
+        h += 360.0
+    let radians = h * math.pi / 180.0
+    let e_hue = 0.25 * (math.cos(radians + 2.0) + 3.8)
+    let ac = p2 * v.nbb
+    let j = 100.0 * math.pow(math.max(ac / v.aw, 0.0), v.c * v.z)
+    let q = 4.0 / v.c * math.sqrt(j / 100.0) * (v.aw + 4.0) * math.pow(v.fl, 0.25)
+    let p1 = 50000.0 / 13.0 * v.nc * v.ncb * e_hue
+    let t = p1 * math.hypot(a, b) / (u + 0.305)
+    let alpha = math.pow(t, 0.9) * math.pow(1.64 - math.pow(0.29, v.n), 0.73)
+    let c = alpha * math.sqrt(j / 100.0)
+    let m = c * math.pow(v.fl, 0.25)
+    let s = 50.0 * math.sqrt(alpha * v.c / (v.aw + 4.0))
+    return Appearance(j, q, c, m, s, h)
+
+# mark: Inverse ===============================================================
+
+## The XYZ (Y = 100 scale) that appears with lightness `j`, chroma `c` and hue
+## `h` degrees under `v`.
+pub func from_jch(j: f64, c: f64, h: f64, v: Viewing) -> XYZ:
+    if j <= 0.0:
+        return XYZ(0.0, 0.0, 0.0)
+    let alpha = c / math.sqrt(j / 100.0)
+    let t = math.pow(alpha / math.pow(1.64 - math.pow(0.29, v.n), 0.73), 1.0 / 0.9)
+    let radians = h * math.pi / 180.0
+    let e_hue = 0.25 * (math.cos(radians + 2.0) + 3.8)
+    let ac = v.aw * math.pow(j / 100.0, 1.0 / v.c / v.z)
+    let p1 = e_hue * (50000.0 / 13.0) * v.nc * v.ncb
+    let p2 = ac / v.nbb
+    let h_sin = math.sin(radians)
+    let h_cos = math.cos(radians)
+    let gamma = 23.0 * (p2 + 0.305) * t / (23.0 * p1 + 11.0 * t * h_cos + 108.0 * t * h_sin)
+    let a = gamma * h_cos
+    let b = gamma * h_sin
+    let ra = (460.0 * p2 + 451.0 * a + 288.0 * b) / 1403.0
+    let ga = (460.0 * p2 - 891.0 * a - 261.0 * b) / 1403.0
+    let ba = (460.0 * p2 - 220.0 * a - 6300.0 * b) / 1403.0
+    let rc = inverse_response(ra, v.fl) / v.rgb_d.x
+    let gc = inverse_response(ga, v.fl) / v.rgb_d.y
+    let bc = inverse_response(ba, v.fl) / v.rgb_d.z
+    return apply(invert(m16), XYZ(rc, gc, bc))
+
+func inverse_response(adapted: f64, fl: f64) -> f64:
+    let magnitude = math.abs(adapted)
+    let base = math.max(0.0, 27.13 * magnitude / (400.0 - magnitude))
+    return math.copysign(100.0 / fl * math.pow(base, 1.0 / 0.42), adapted)
+
+# mark: UCS ===================================================================
+
+## CAM16-UCS from an appearance.
+pub func to_ucs(app: Appearance) -> UCS:
+    let j = 1.7 * app.j / (1.0 + 0.007 * app.j)
+    let m = math.log(1.0 + 0.0228 * app.m) / 0.0228
+    let radians = app.h * math.pi / 180.0
+    return UCS(j, m * math.cos(radians), m * math.sin(radians))
+
+## The lightness J and colourfulness M an UCS point stands for, and its hue.
+pub func from_ucs(ucs: UCS, v: Viewing) -> XYZ:
+    let j = ucs.j / (1.7 - 0.007 * ucs.j)
+    let m = (math.exp(ucs.b * 0.0 + math.hypot(ucs.a, ucs.b) * 0.0228) - 1.0) / 0.0228
+    let c = m / math.pow(v.fl, 0.25)
+    var h = math.atan2(ucs.b, ucs.a) * 180.0 / math.pi
+    if h < 0.0:
+        h += 360.0
+    return from_jch(j, c, h, v)
+
+## The CAM16-UCS colour difference: Euclidean, with ΔE about 1 just noticeable.
+pub func delta_e(a: UCS, b: UCS) -> f64:
+    return math.sqrt((a.j - b.j) * (a.j - b.j) + (a.a - b.a) * (a.a - b.a) + (a.b - b.b) * (a.b - b.b))
+
+# mark: Tests =================================================================
+
+func near(a: f64, b: f64, tolerance: f64 = 0.01) -> bool:
+    return math.abs(a - b) < tolerance
+
+## Under incomplete adaptation (D = 0.9 at 40 cd/m²) even the white keeps a
+## little chroma, as the model intends; complete adaptation would zero it.
+test "the white has lightness 100 and almost no chroma; mid grey sits below":
+    let v = viewing()
+    let white = appearance(XYZ(95.047, 100.0, 108.883), v)
+    assert(near(white.j, 100.0, 0.05) and white.c < 3.0)
+    let grey = appearance(XYZ(95.047 * 0.18, 18.0, 108.883 * 0.18), v)
+    # CAM16 lightness is not L*: an 18 % grey (L* 50) reads J about 39.
+    assert(grey.j > 35.0 and grey.j < 45.0 and grey.c < 3.0)
+
+test "appearance inverts back to the same XYZ":
+    let v = viewing()
+    for sample in [XYZ(41.24, 21.26, 1.93), XYZ(35.76, 71.52, 11.92), XYZ(18.05, 7.22, 95.05), XYZ(30.0, 40.0, 20.0)]:
+        let app = appearance(sample, v)
+        let back = from_jch(app.j, app.c, app.h, v)
+        assert(near(back.x, sample.x, 0.05) and near(back.y, sample.y, 0.05) and near(back.z, sample.z, 0.05))
+        let ucs = from_ucs(to_ucs(app), v)
+        assert(near(ucs.x, sample.x, 0.05) and near(ucs.y, sample.y, 0.05) and near(ucs.z, sample.z, 0.05))
+
+test "sRGB red under default conditions has the expected hue and a large chroma":
+    let red = appearance(XYZ(41.24, 21.26, 1.93), viewing())
+    assert(red.h > 20.0 and red.h < 40.0 and red.c > 80.0 and red.j > 40.0 and red.j < 60.0)
+    assert(delta_e(to_ucs(red), to_ucs(red)) == 0.0)

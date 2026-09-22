@@ -1,0 +1,125 @@
+## Transfer functions: how a display-encoded component relates to linear light.
+## Every RGB space in `space` pairs a set of primaries with one of these.
+import math
+
+# mark: Transfer ==============================================================
+
+## The encodings this library knows. `pq` and `hlg` are the HDR curves of
+## Rec. 2100; a PQ signal's linear value is relative to 10 000 cd/m² (1.0), an
+## HLG signal's to the nominal peak (1.0).
+pub enum Transfer as u8:
+    linear = 0
+    srgb = 1
+    gamma_18 = 2
+    gamma_22 = 3
+    gamma_24 = 4
+    pq = 5
+    hlg = 6
+
+## Encoded to linear for `transfer`. Values outside 0..1 pass through the
+## curve's continuation (mirrored for negatives) so out-of-gamut colours survive.
+pub func decode(encoded: f64, transfer: Transfer) -> f64:
+    if transfer == Transfer.srgb:
+        return srgb_decode(encoded)
+    if transfer == Transfer.gamma_18:
+        return gamma_decode(encoded, 1.8)
+    if transfer == Transfer.gamma_22:
+        return gamma_decode(encoded, 2.2)
+    if transfer == Transfer.gamma_24:
+        return gamma_decode(encoded, 2.4)
+    if transfer == Transfer.pq:
+        return pq_decode(encoded)
+    if transfer == Transfer.hlg:
+        return hlg_decode(encoded)
+    return encoded
+
+## Linear to encoded for `transfer`.
+pub func encode(linear: f64, transfer: Transfer) -> f64:
+    if transfer == Transfer.srgb:
+        return srgb_encode(linear)
+    if transfer == Transfer.gamma_18:
+        return gamma_encode(linear, 1.8)
+    if transfer == Transfer.gamma_22:
+        return gamma_encode(linear, 2.2)
+    if transfer == Transfer.gamma_24:
+        return gamma_encode(linear, 2.4)
+    if transfer == Transfer.pq:
+        return pq_encode(linear)
+    if transfer == Transfer.hlg:
+        return hlg_encode(linear)
+    return linear
+
+# mark: Curves ================================================================
+
+## The IEC 61966-2-1 piecewise curve, mirrored for negatives.
+pub func srgb_decode(encoded: f64) -> f64:
+    let magnitude = math.abs(encoded)
+    let linear = magnitude / 12.92 if magnitude <= 0.04045 else math.pow((magnitude + 0.055) / 1.055, 2.4)
+    return math.copysign(linear, encoded)
+
+pub func srgb_encode(linear: f64) -> f64:
+    let magnitude = math.abs(linear)
+    let encoded = magnitude * 12.92 if magnitude <= 0.0031308 else 1.055 * math.pow(magnitude, 1.0 / 2.4) - 0.055
+    return math.copysign(encoded, linear)
+
+## A pure power curve, mirrored for negatives.
+pub func gamma_decode(encoded: f64, gamma: f64) -> f64:
+    return math.copysign(math.pow(math.abs(encoded), gamma), encoded)
+
+pub func gamma_encode(linear: f64, gamma: f64) -> f64:
+    return math.copysign(math.pow(math.abs(linear), 1.0 / gamma), linear)
+
+## SMPTE ST 2084 (PQ): the signal 0..1 against linear luminance relative to
+## 10 000 cd/m², so 1.0 linear is the peak and 0.01 is 100 cd/m².
+pub func pq_decode(encoded: f64) -> f64:
+    let e = math.clamp(encoded, 0.0, 1.0)
+    let p = math.pow(e, 1.0 / pq_m2)
+    let numerator = math.max(p - pq_c1, 0.0)
+    let denominator = pq_c2 - pq_c3 * p
+    return math.pow(numerator / denominator, 1.0 / pq_m1)
+
+pub func pq_encode(linear: f64) -> f64:
+    let y = math.clamp(linear, 0.0, 1.0)
+    let p = math.pow(y, pq_m1)
+    return math.pow((pq_c1 + pq_c2 * p) / (1.0 + pq_c3 * p), pq_m2)
+
+let pq_m1: f64 = 2610.0 / 16384.0
+let pq_m2: f64 = 2523.0 / 4096.0 * 128.0
+let pq_c1: f64 = 3424.0 / 4096.0
+let pq_c2: f64 = 2413.0 / 4096.0 * 32.0
+let pq_c3: f64 = 2392.0 / 4096.0 * 32.0
+
+## ARIB STD-B67 (HLG) OETF and its inverse, scene light 0..1 to signal 0..1.
+pub func hlg_encode(linear: f64) -> f64:
+    let e = math.clamp(linear, 0.0, 1.0)
+    if e <= 1.0 / 12.0:
+        return math.sqrt(3.0 * e)
+    return hlg_a * math.log(12.0 * e - hlg_b) + hlg_c
+
+pub func hlg_decode(encoded: f64) -> f64:
+    let s = math.clamp(encoded, 0.0, 1.0)
+    if s <= 0.5:
+        return s * s / 3.0
+    return (math.exp((s - hlg_c) / hlg_a) + hlg_b) / 12.0
+
+let hlg_a: f64 = 0.17883277
+let hlg_b: f64 = 0.28466892
+let hlg_c: f64 = 0.55991073
+
+# mark: Tests =================================================================
+
+func near(a: f64, b: f64, tolerance: f64 = 0.0001) -> bool:
+    return math.abs(a - b) < tolerance
+
+test "every transfer round-trips and meets its anchors":
+    for transfer in [Transfer.linear, Transfer.srgb, Transfer.gamma_18, Transfer.gamma_22, Transfer.gamma_24, Transfer.pq, Transfer.hlg]:
+        for sample in [0.0, 0.001, 0.02, 0.18, 0.5, 0.9, 1.0]:
+            assert(near(decode(encode(sample, transfer), transfer), sample, 0.000001))
+    assert(near(srgb_decode(0.5), 0.214041))
+    assert(near(srgb_encode(0.18), 0.461356))
+    assert(near(srgb_decode(-0.5), -0.214041))
+    # 100 cd/m² sits at PQ 0.508 and 1000 cd/m² at 0.752 (ST 2084's own tables).
+    assert(near(pq_encode(0.01), 0.5081, 0.001))
+    assert(near(pq_encode(0.1), 0.7518, 0.001))
+    assert(near(hlg_encode(1.0 / 12.0), 0.5))
+    assert(near(hlg_encode(1.0), 1.0, 0.001))

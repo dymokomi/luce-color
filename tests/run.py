@@ -10,7 +10,8 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--base", type=Path, default=ROOT.parent / ("luce-base/build/luce-base.exe" if os.name == "nt" else "luce-base/build/luce-base"))
 args = parser.parse_args()
 env = dict(os.environ, LUCE_BASE=str(args.base.resolve()))
-module = ROOT / "src/luce_color/color.lucb"
-for flags in [["--native"], ["--backend=c"]]:
-    subprocess.run([str(args.base.resolve()), "test", str(module), *flags], check=True, env=env, timeout=120)
-print("PASS luce-color Oklab conversions and derivations, native and comparison modes")
+for name in ["color", "transfer", "xyz", "lab", "cam16", "hsl", "space"]:
+    module = ROOT / f"src/luce_color/{name}.lucb"
+    for flags in [["--native"], ["--backend=c"]]:
+        subprocess.run([str(args.base.resolve()), "test", str(module), *flags], check=True, env=env, timeout=300)
+print("PASS luce-color colour science: Oklab, transfer curves, XYZ, Lab, CAM16, HSL and spaces, native and comparison modes")
