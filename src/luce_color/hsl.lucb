@@ -1,6 +1,6 @@
 ## The artist's cylinders over display-encoded RGB: HSV (hue, saturation,
 ## value — Photoshop's HSB) and HSL. Hue is degrees 0..360; the rest 0..1.
-## These are conveniences for pickers, not colour science: two colours a step
+## These are conveniences for pickers, not color science: two colors a step
 ## apart in HSV need not look a step apart.
 import math
 from luce_color.color import Color
@@ -75,7 +75,7 @@ pub func from_hsl(hsl: HSL) -> Color:
 
 # mark: Helpers ===============================================================
 
-## The hue of a colour given its maximum component and range, 0..360.
+## The hue of a color given its maximum component and range, 0..360.
 func hue_of(color: Color, top: f64, delta: f64) -> f64:
     if delta <= 0.0:
         return 0.0

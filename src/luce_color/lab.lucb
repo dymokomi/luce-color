@@ -1,4 +1,4 @@
-## CIELAB and its polar form, the colour differences built on them, and the
+## CIELAB and its polar form, the color differences built on them, and the
 ## polar form of Oklab. Lab needs a white: pass the one the XYZ is relative to.
 import math
 from luce_color.color import Oklab

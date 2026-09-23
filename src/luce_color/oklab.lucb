@@ -37,7 +37,7 @@ pub func delta_e(a: Oklab, b: Oklab) -> f64:
 
 # mark: Gamut =================================================================
 
-## Linear sRGB of an Oklab colour without clamping, for gamut tests.
+## Linear sRGB of an Oklab color without clamping, for gamut tests.
 pub func to_linear_unclamped(lab: Oklab) -> Color:
     let l_ = lab.l + 0.3963377774 * lab.a + 0.2158037573 * lab.b
     let m_ = lab.l - 0.1055613458 * lab.a - 0.0638541728 * lab.b
@@ -49,7 +49,7 @@ pub func to_linear_unclamped(lab: Oklab) -> Color:
                  -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
                  -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
 
-## Whether an Oklab colour lies inside the sRGB cube, within a hair.
+## Whether an Oklab color lies inside the sRGB cube, within a hair.
 pub func in_srgb(lab: Oklab, tolerance: f64 = 0.0005) -> bool:
     let c = to_linear_unclamped(lab)
     return c.red >= -tolerance and c.red <= 1.0 + tolerance and c.green >= -tolerance and c.green <= 1.0 + tolerance and c.blue >= -tolerance and c.blue <= 1.0 + tolerance
@@ -69,14 +69,14 @@ pub func max_chroma(l: f64, h: f64) -> f64:
             high = middle
     return low
 
-## An OkLCh colour brought into sRGB by reducing chroma alone, keeping its
+## An OkLCh color brought into sRGB by reducing chroma alone, keeping its
 ## lightness and hue: the CSS Color 4 gamut map. Returns linear sRGB.
 pub func to_srgb(lch: LCh) -> Color:
     let l = math.clamp(lch.l, 0.0, 1.0)
     let limit = max_chroma(l, lch.h)
     return to_color(oklch_to_oklab(LCh(l, math.min(math.max(lch.c, 0.0), limit), lch.h)))
 
-## The colour at a fraction of the chroma sRGB allows for its lightness and
+## The color at a fraction of the chroma sRGB allows for its lightness and
 ## hue: a picker's "saturation" axis that never leaves the gamut.
 pub func at_relative_chroma(l: f64, fraction: f64, h: f64) -> Color:
     return to_color(oklch_to_oklab(LCh(l, max_chroma(l, h) * math.clamp(fraction, 0.0, 1.0), h)))

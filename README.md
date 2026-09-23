@@ -1,8 +1,8 @@
 # luce-color
 
-Colour science for Luce, written in Luce Base. Everything that turns numbers
-into colours and colours into what the eye sees lives here, so an editor, a
-UI theme and a file codec agree about what a colour is:
+Color science for Luce, written in Luce Base. Everything that turns numbers
+into colors and colors into what the eye sees lives here, so an editor, a
+UI theme and a file codec agree about what a color is:
 
 | module | what it holds |
 | --- | --- |
@@ -27,14 +27,14 @@ let shown = space.clamp(red)
 # How different are two paints? CIEDE2000 about 1 is a just-noticeable step.
 let difference = lab.delta_e2000(space.to_lab(a, space.srgb), space.to_lab(b, space.srgb))
 
-# What a colour looks like on this display: CAM16 lightness, chroma and hue.
+# What a color looks like on this display: CAM16 lightness, chroma and hue.
 let look = space.to_appearance(a, space.srgb, space.display_viewing(space.srgb))
 ```
 
 Numbers are checked against the published references in each module's tests:
 the sRGB matrix, ST 2084's luminance anchors, Sharma's CIEDE2000 pairs, CAM16's
 white and inverse. An OCIO config reader is not here yet; `space.convert` is the
-processor chain one would produce for a pair of its colour spaces.
+processor chain one would produce for a pair of its color spaces.
 
 ## Theme derivations (`color`)
 

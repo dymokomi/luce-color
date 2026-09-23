@@ -1,4 +1,4 @@
-## Colour spaces the way OpenColorIO thinks of them: a name, a set of primaries
+## Color spaces the way OpenColorIO thinks of them: a name, a set of primaries
 ## with a white, and a transfer function. `convert` is the processor chain OCIO
 ## would build for a pair of them — decode, matrix, adapt, matrix, encode —
 ## and `to_lab`/`to_appearance` take any space to the perceptual models.
@@ -48,12 +48,12 @@ pub func decode(color: Color, space: ColorSpace) -> Color:
 pub func encode(color: Color, space: ColorSpace) -> Color:
     return Color(transfer.encode(color.red, space.transfer), transfer.encode(color.green, space.transfer), transfer.encode(color.blue, space.transfer))
 
-## An encoded colour in `source` as an encoded colour in `target`, unclamped; see
+## An encoded color in `source` as an encoded color in `target`, unclamped; see
 ## `in_gamut` and `clamp`.
 pub func convert(color: Color, source: ColorSpace, target: ColorSpace) -> Color:
     return encode(xyz.convert(decode(color, source), source.primaries, target.primaries), target)
 
-## The XYZ (white at Y = 1, in the space's own white) of an encoded colour.
+## The XYZ (white at Y = 1, in the space's own white) of an encoded color.
 pub func to_xyz(color: Color, space: ColorSpace) -> xyz.XYZ:
     return xyz.to_xyz(decode(color, space), space.primaries)
 
@@ -108,7 +108,7 @@ test "conversions round-trip and known pairs hold":
     let white = convert(Color(1.0, 1.0, 1.0), srgb, prophoto)
     assert(near(white.red, 1.0) and near(white.green, 1.0) and near(white.blue, 1.0))
 
-test "Lab, Oklab and CAM16 read an sRGB colour sensibly":
+test "Lab, Oklab and CAM16 read an sRGB color sensibly":
     let grey = to_lab(Color(0.5, 0.5, 0.5), srgb)
     assert(near(grey.l, 53.39, 0.05) and near(grey.a, 0.0, 0.01) and near(grey.b, 0.0, 0.01))
     let ok = to_oklab_in(Color(1.0, 1.0, 1.0), srgb)

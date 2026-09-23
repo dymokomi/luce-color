@@ -17,7 +17,7 @@ pub enum Transfer as u8:
     hlg = 6
 
 ## Encoded to linear for `transfer`. Values outside 0..1 pass through the
-## curve's continuation (mirrored for negatives) so out-of-gamut colours survive.
+## curve's continuation (mirrored for negatives) so out-of-gamut colors survive.
 pub func decode(encoded: f64, transfer: Transfer) -> f64:
     if transfer == Transfer.srgb:
         return srgb_decode(encoded)

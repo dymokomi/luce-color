@@ -14,4 +14,4 @@ for name in ["color", "transfer", "xyz", "lab", "cam16", "hsl", "space", "oklab"
     module = ROOT / f"src/luce_color/{name}.lucb"
     for flags in [["--native"], ["--backend=c"]]:
         subprocess.run([str(args.base.resolve()), "test", str(module), *flags], check=True, env=env, timeout=300)
-print("PASS luce-color colour science: Oklab, transfer curves, XYZ, Lab, CAM16, HSL and spaces, native and comparison modes")
+print("PASS luce-color color science: Oklab, transfer curves, XYZ, Lab, CAM16, HSL and spaces, native and comparison modes")

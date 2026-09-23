@@ -1,7 +1,7 @@
-## CAM16 (Li et al. 2017): what a colour looks like under given viewing
-## conditions — lightness J, chroma C, hue h, colourfulness M, saturation s,
+## CAM16 (Li et al. 2017): what a color looks like under given viewing
+## conditions — lightness J, chroma C, hue h, colorfulness M, saturation s,
 ## brightness Q — and CAM16-UCS, the uniform space built on it, whose Euclidean
-## distance is a colour difference. XYZ here is on the Y = 100 scale.
+## distance is a color difference. XYZ here is on the Y = 100 scale.
 import math
 from luce_color.xyz import XYZ, Matrix3, apply, invert
 
@@ -23,7 +23,7 @@ pub struct Viewing:
     var aw: f64 = 0.0
     var rgb_d: XYZ = XYZ(1.0, 1.0, 1.0)
 
-## A colour's appearance under some viewing conditions.
+## A color's appearance under some viewing conditions.
 pub struct Appearance:
     pub var j: f64
     pub var q: f64
@@ -142,7 +142,7 @@ pub func to_ucs(app: Appearance) -> UCS:
     let radians = app.h * math.pi / 180.0
     return UCS(j, m * math.cos(radians), m * math.sin(radians))
 
-## The lightness J and colourfulness M an UCS point stands for, and its hue.
+## The lightness J and colorfulness M an UCS point stands for, and its hue.
 pub func from_ucs(ucs: UCS, v: Viewing) -> XYZ:
     let j = ucs.j / (1.7 - 0.007 * ucs.j)
     let m = (math.exp(ucs.b * 0.0 + math.hypot(ucs.a, ucs.b) * 0.0228) - 1.0) / 0.0228
@@ -152,7 +152,7 @@ pub func from_ucs(ucs: UCS, v: Viewing) -> XYZ:
         h += 360.0
     return from_jch(j, c, h, v)
 
-## The CAM16-UCS colour difference: Euclidean, with ΔE about 1 just noticeable.
+## The CAM16-UCS color difference: Euclidean, with ΔE about 1 just noticeable.
 pub func delta_e(a: UCS, b: UCS) -> f64:
     return math.sqrt((a.j - b.j) * (a.j - b.j) + (a.a - b.a) * (a.a - b.a) + (a.b - b.b) * (a.b - b.b))
 

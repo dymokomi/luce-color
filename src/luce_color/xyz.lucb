@@ -1,4 +1,4 @@
-## CIE XYZ, the hub every colour space meets at, and the RGB spaces defined on
+## CIE XYZ, the hub every color space meets at, and the RGB spaces defined on
 ## it by their primaries and white: matrices are derived from chromaticities,
 ## never typed in, and whites are reconciled by Bradford adaptation.
 import math
@@ -124,7 +124,7 @@ pub func xyz_to_rgb(primaries: Primaries) -> Matrix3:
 
 # mark: Adaptation ============================================================
 
-## The Bradford chromatic adaptation from one white to another, so a colour
+## The Bradford chromatic adaptation from one white to another, so a color
 ## keeps its appearance when the spaces disagree about white (sRGB's D65 against
 ## ProPhoto's D50, say). Equal whites give the identity.
 pub func adapt(source: Chromaticity, target: Chromaticity) -> Matrix3:
@@ -144,7 +144,7 @@ let bradford: Matrix3 = Matrix3([0.8951, 0.2664, -0.1614, -0.7502, 1.7135, 0.036
 pub func to_xyz(color: Color, primaries: Primaries) -> XYZ:
     return apply(rgb_to_xyz(primaries), XYZ(color.red, color.green, color.blue))
 
-## XYZ (in the primaries' white) to linear RGB, unclamped: a colour outside
+## XYZ (in the primaries' white) to linear RGB, unclamped: a color outside
 ## the gamut shows as a component outside 0..1.
 pub func from_xyz(value: XYZ, primaries: Primaries) -> Color:
     let rgb = apply(xyz_to_rgb(primaries), value)
@@ -168,7 +168,7 @@ test "sRGB's derived matrix matches the published one":
     let white = to_xyz(Color(1.0, 1.0, 1.0), srgb)
     assert(near(white.x, 0.9505, 0.0005) and near(white.y, 1.0) and near(white.z, 1.0888, 0.0005))
 
-test "a matrix inverts and a colour round-trips through XYZ":
+test "a matrix inverts and a color round-trips through XYZ":
     let identity = multiply(rgb_to_xyz(rec2020), xyz_to_rgb(rec2020))
     for index in 0..<(usize)9:
         assert(near(identity.m[index], 1.0 if index % 4 == 0 else 0.0, 0.000001))
