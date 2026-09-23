@@ -10,7 +10,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--base", type=Path, default=ROOT.parent / ("luce-base/build/luce-base.exe" if os.name == "nt" else "luce-base/build/luce-base"))
 args = parser.parse_args()
 env = dict(os.environ, LUCE_BASE=str(args.base.resolve()))
-for name in ["color", "transfer", "xyz", "lab", "cam16", "hsl", "space"]:
+for name in ["color", "transfer", "xyz", "lab", "cam16", "hsl", "space", "oklab"]:
     module = ROOT / f"src/luce_color/{name}.lucb"
     for flags in [["--native"], ["--backend=c"]]:
         subprocess.run([str(args.base.resolve()), "test", str(module), *flags], check=True, env=env, timeout=300)

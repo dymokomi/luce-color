@@ -1,0 +1,118 @@
+## Oklab beyond the theme derivations in `color`: the XYZ definition, the
+## perceptual difference, and the sRGB gamut seen from OkLCh — how much chroma
+## a lightness and hue can carry, and the gamut mapping that keeps hue and
+## lightness while giving up chroma (CSS Color 4's approach), which is what a
+## picker wants when a Lab or OkLCh edit leaves the display's gamut.
+import math
+from luce_color.color import Color, Oklab, to_oklab, to_color
+from luce_color.lab import LCh, oklab_to_oklch, oklch_to_oklab
+from luce_color.xyz import XYZ, Matrix3, apply
+
+# mark: XYZ ===================================================================
+
+## XYZ (D65, white at Y = 1) to Oklab, by Ottosson's M1 and M2.
+pub func xyz_to_oklab(value: XYZ) -> Oklab:
+    let lms = apply(m1, value)
+    let l_ = math.cbrt(lms.x)
+    let m_ = math.cbrt(lms.y)
+    let s_ = math.cbrt(lms.z)
+    return Oklab(0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+                 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+                 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_)
+
+pub func oklab_to_xyz(lab: Oklab) -> XYZ:
+    let l_ = lab.l + 0.3963377774 * lab.a + 0.2158037573 * lab.b
+    let m_ = lab.l - 0.1055613458 * lab.a - 0.0638541728 * lab.b
+    let s_ = lab.l - 0.0894841775 * lab.a - 1.2914855480 * lab.b
+    return apply(m1_inverse, XYZ(l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_))
+
+let m1: Matrix3 = Matrix3([0.8189330101, 0.3618667424, -0.1288597137, 0.0329845436, 0.9293118715, 0.0361456387, 0.0482003018, 0.2643662691, 0.6338517070])
+let m1_inverse: Matrix3 = Matrix3([1.2270138511, -0.5577999807, 0.2812561490, -0.0405801784, 1.1122568696, -0.0716766787, -0.0763812845, -0.4214819784, 1.5861632204])
+
+# mark: Difference ============================================================
+
+## ΔEok: the Euclidean distance in Oklab. About 0.02 is a just-noticeable step.
+pub func delta_e(a: Oklab, b: Oklab) -> f64:
+    return math.sqrt((a.l - b.l) * (a.l - b.l) + (a.a - b.a) * (a.a - b.a) + (a.b - b.b) * (a.b - b.b))
+
+# mark: Gamut =================================================================
+
+## Linear sRGB of an Oklab colour without clamping, for gamut tests.
+pub func to_linear_unclamped(lab: Oklab) -> Color:
+    let l_ = lab.l + 0.3963377774 * lab.a + 0.2158037573 * lab.b
+    let m_ = lab.l - 0.1055613458 * lab.a - 0.0638541728 * lab.b
+    let s_ = lab.l - 0.0894841775 * lab.a - 1.2914855480 * lab.b
+    let l = l_ * l_ * l_
+    let m = m_ * m_ * m_
+    let s = s_ * s_ * s_
+    return Color(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+                 -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+                 -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
+
+## Whether an Oklab colour lies inside the sRGB cube, within a hair.
+pub func in_srgb(lab: Oklab, tolerance: f64 = 0.0005) -> bool:
+    let c = to_linear_unclamped(lab)
+    return c.red >= -tolerance and c.red <= 1.0 + tolerance and c.green >= -tolerance and c.green <= 1.0 + tolerance and c.blue >= -tolerance and c.blue <= 1.0 + tolerance
+
+## The most chroma sRGB can show at Oklab lightness `l` (0..1) and hue `h`
+## degrees, found by bisection; zero at black and white.
+pub func max_chroma(l: f64, h: f64) -> f64:
+    if l <= 0.0 or l >= 1.0:
+        return 0.0
+    var low = 0.0
+    var high = 0.5
+    for _ in 0..<32:
+        let middle = (low + high) * 0.5
+        if in_srgb(oklch_to_oklab(LCh(l, middle, h))):
+            low = middle
+        else:
+            high = middle
+    return low
+
+## An OkLCh colour brought into sRGB by reducing chroma alone, keeping its
+## lightness and hue: the CSS Color 4 gamut map. Returns linear sRGB.
+pub func to_srgb(lch: LCh) -> Color:
+    let l = math.clamp(lch.l, 0.0, 1.0)
+    let limit = max_chroma(l, lch.h)
+    return to_color(oklch_to_oklab(LCh(l, math.min(math.max(lch.c, 0.0), limit), lch.h)))
+
+## The colour at a fraction of the chroma sRGB allows for its lightness and
+## hue: a picker's "saturation" axis that never leaves the gamut.
+pub func at_relative_chroma(l: f64, fraction: f64, h: f64) -> Color:
+    return to_color(oklch_to_oklab(LCh(l, max_chroma(l, h) * math.clamp(fraction, 0.0, 1.0), h)))
+
+# mark: Tests =================================================================
+
+func near(a: f64, b: f64, tolerance: f64 = 0.0005) -> bool:
+    return math.abs(a - b) < tolerance
+
+test "Oklab from XYZ agrees with Oklab from linear sRGB":
+    for sample in [Color(1.0, 1.0, 1.0), Color(1.0, 0.0, 0.0), Color(0.2, 0.66, 0.92), Color(0.05, 0.05, 0.05)]:
+        let direct = to_oklab(sample)
+        # sRGB to XYZ by the published matrix, then to Oklab.
+        let xyz = XYZ(0.4124564 * sample.red + 0.3575761 * sample.green + 0.1804375 * sample.blue,
+                      0.2126729 * sample.red + 0.7151522 * sample.green + 0.0721750 * sample.blue,
+                      0.0193339 * sample.red + 0.1191920 * sample.green + 0.9503041 * sample.blue)
+        let via = xyz_to_oklab(xyz)
+        assert(near(direct.l, via.l, 0.002) and near(direct.a, via.a, 0.002) and near(direct.b, via.b, 0.002))
+        let back = oklab_to_xyz(via)
+        assert(near(back.x, xyz.x, 0.001) and near(back.y, xyz.y, 0.001) and near(back.z, xyz.z, 0.001))
+    let white = to_oklab(Color(1.0, 1.0, 1.0))
+    assert(near(white.l, 1.0, 0.001) and near(white.a, 0.0, 0.001) and near(white.b, 0.0, 0.001))
+
+test "gamut: max chroma peaks in the middle and mapping keeps lightness and hue":
+    assert(max_chroma(0.0, 30.0) == 0.0 and max_chroma(1.0, 30.0) == 0.0)
+    let mid = max_chroma(0.6, 30.0)
+    assert(mid > 0.1 and mid < 0.35)
+    assert(max_chroma(0.95, 30.0) < mid and max_chroma(0.2, 30.0) < mid)
+    let loud = LCh(0.7, 0.5, 30.0)
+    let shown = to_srgb(loud)
+    assert(shown.red >= 0.0 and shown.red <= 1.0 and shown.green >= 0.0 and shown.blue >= 0.0)
+    let mapped = oklab_to_oklch(to_oklab(shown))
+    assert(near(mapped.l, 0.7, 0.01) and near(mapped.h, 30.0, 1.0) and mapped.c < 0.5)
+    let quiet = to_srgb(LCh(0.5, 0.05, 200.0))
+    let kept = oklab_to_oklch(to_oklab(quiet))
+    assert(near(kept.c, 0.05, 0.001))
+    let edge = to_oklab(at_relative_chroma(0.6, 1.0, 120.0))
+    assert(in_srgb(edge, 0.002))
+    assert(delta_e(Oklab(0.5, 0.0, 0.0), Oklab(0.5, 0.03, 0.04)) > 0.0499 and delta_e(Oklab(0.5, 0.0, 0.0), Oklab(0.5, 0.03, 0.04)) < 0.0501)
