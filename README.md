@@ -7,7 +7,7 @@ UI theme and a file codec agree about what a color is:
 | module | what it holds |
 | --- | --- |
 | `color` | `Color` (linear sRGB, the GPU model), Oklab, and the surface derivations luce-ui themes use (`elevate`, `blend`) |
-| `transfer` | transfer functions: sRGB, gamma 1.8/2.2/2.4, PQ (ST 2084), HLG; `encode`/`decode` by `Transfer` |
+| `transfer` | transfer functions: sRGB, gamma 1.8/2.2/2.4, PQ (ST 2084), HLG; `encode`/`decode` by `Transfer`; for per-pixel CPU loops `srgb_byte` and `SrgbTable` (the decoding interpolated from 4097 samples) |
 | `xyz` | CIE XYZ, chromaticities and whites (D65, D50, ACES), `Primaries` for sRGB, Display P3, Adobe RGB, Rec. 2020, ACES AP0/AP1, ProPhoto; matrices *derived* from chromaticities; Bradford adaptation; `convert` between primaries |
 | `lab` | CIELAB and LCh against any white, ΔE76 and CIEDE2000, OkLCh |
 | `cam16` | CAM16 viewing conditions, appearance (J, Q, C, M, s, h), the inverse from JCh, CAM16-UCS and its ΔE |
@@ -30,6 +30,9 @@ let difference = lab.delta_e2000(space.to_lab(a, space.srgb), space.to_lab(b, sp
 # What a color looks like on this display: CAM16 lightness, chroma and hue.
 let look = space.to_appearance(a, space.srgb, space.display_viewing(space.srgb))
 ```
+
+The sRGB curve for GLSL shaders is `shaders/srgb.glsl`: luce-painting's and luce-image's
+shaders include it (`embed_shaders.py -I ../luce-color/shaders`), so there is one copy.
 
 Numbers are checked against the published references in each module's tests:
 the sRGB matrix, ST 2084's luminance anchors, Sharma's CIEDE2000 pairs, CAM16's

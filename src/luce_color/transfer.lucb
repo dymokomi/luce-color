@@ -1,6 +1,8 @@
 ## Transfer functions: how a display-encoded component relates to linear light.
 ## Every RGB space in `space` pairs a set of primaries with one of these.
+## The same sRGB curve for GLSL is `shaders/srgb.glsl` beside `src`.
 import math
+import memory
 
 # mark: Transfer ==============================================================
 
@@ -106,6 +108,53 @@ let hlg_a: f64 = 0.17883277
 let hlg_b: f64 = 0.28466892
 let hlg_c: f64 = 0.55991073
 
+# mark: sRGB per pixel ========================================================
+
+## The 8-bit sRGB code of a linear component: clamped to 0..1, encoded, rounded.
+pub func srgb_byte(linear: f64) -> u8:
+    let encoded = srgb_encode(math.clamp(linear, 0.0, 1.0))
+    return (u8)math.floor(encoded * 255.0 + 0.5)
+
+## `table` filled with the 8-bit sRGB codes of its steps from 0 to 1: entry `i`
+## is the code of `i / (length - 1)`. With 4097 entries, a CPU loop reading
+## linear samples indexes it with the sample times 4096 instead of encoding.
+pub func srgb_byte_table(table: u8[]):
+    let last = (f64)(table.length - 1) if table.length > 1 else 1.0
+    for step in 0..<table.length:
+        table[step] = srgb_byte((f64)step / last)
+
+## Steps of an `SrgbTable` between 0 and 1.
+pub let srgb_table_steps: usize = 4096
+
+## sRGB's decoding sampled at 4097 points on 0..1 and read back by
+## interpolation (within a few 1e-8 of the curve): CPU loops that decode texel
+## by texel do not pay a power per sample. Heap storage; `destroy` frees it.
+pub struct SrgbTable:
+    var decoded: f32[]
+
+    pub static func create() -> SrgbTable!:
+        let decoded = try alloc f32[srgb_table_steps + 1] in memory.heap
+        for step in 0..<srgb_table_steps + 1:
+            decoded[step] = (f32)srgb_decode((f64)step / (f64)srgb_table_steps)
+        return SrgbTable(decoded = decoded)
+
+    ## Linear light of encoded `value`; past 0..1 from the curve itself.
+    pub func decode(value: f32) -> f32:
+        if not (value >= 0.0 and value <= 1.0):
+            return (f32)srgb_decode((f64)value)
+        let at = value * (f32)srgb_table_steps
+        let step = (usize)at
+        if step >= srgb_table_steps:
+            return self.decoded[srgb_table_steps]
+        let f = at - (f32)step
+        return self.decoded[step] + (self.decoded[step + 1] - self.decoded[step]) * f
+
+    pub mutating func destroy():
+        if self.decoded.length > 0:
+            free(self.decoded) in memory.heap
+        var nothing: f32[]
+        self.decoded = nothing
+
 # mark: Tests =================================================================
 
 func near(a: f64, b: f64, tolerance: f64 = 0.0001) -> bool:
@@ -123,3 +172,18 @@ test "every transfer round-trips and meets its anchors":
     assert(near(pq_encode(0.1), 0.7518, 0.001))
     assert(near(hlg_encode(1.0 / 12.0), 0.5))
     assert(near(hlg_encode(1.0), 1.0, 0.001))
+
+test "the sRGB table decodes as the curve does, and bytes round the encoding":
+    var table = try SrgbTable.create()
+    defer table.destroy()
+    var step: usize = 0
+    while step <= 1000:
+        let value = (f64)step / 1000.0
+        assert(math.abs((f64)table.decode((f32)value) - srgb_decode(value)) < 1e-6)
+        step += 1
+    assert(math.abs((f64)table.decode(1.5) - srgb_decode(1.5)) < 1e-6)
+    assert(srgb_byte(0.0) == 0 and srgb_byte(1.0) == 255 and srgb_byte(2.0) == 255 and srgb_byte(-1.0) == 0)
+    assert(srgb_byte(0.2) == 124 and srgb_byte(0.5) == 188)
+    var codes: u8[4097] = ---
+    srgb_byte_table(codes)
+    assert(codes[0] == 0 and codes[4096] == 255 and codes[2048] == srgb_byte(0.5))
