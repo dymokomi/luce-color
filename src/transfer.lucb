@@ -1,7 +1,7 @@
 ## Transfer functions: how a display-encoded component relates to linear light.
 ## Every RGB space in `space` pairs a set of primaries with one of these.
 ## The same sRGB curve for GLSL is `shaders/srgb.glsl` beside `src`.
-import luce_std.math
+from luce_std import math
 import memory
 
 # mark: Transfer ==============================================================

@@ -2,7 +2,7 @@
 ## hover, active and focus variants are derived here so a palette stays internally
 ## consistent — a grayscale theme yields grayscale states, a tinted one stays in
 ## family. Work happens in Oklab (Ottosson 2020), where equal steps look equal.
-import luce_std.math
+from luce_std import math
 
 # mark: Types =================================================================
 

@@ -16,9 +16,7 @@ UI theme and a file codec agree about what a color is:
 | `space` | `ColorSpace` = name + primaries + transfer, as OpenColorIO models one; a catalogue (`space.all`, `space.named`); `convert(color, from, to)` — decode, matrix, adapt, matrix, encode — plus `to_lab`, `to_oklab_in`, `to_appearance`, `in_gamut`, `clamp` |
 
 ```luce
-import luce_color.space
-import luce_color.lab
-import luce_color.cam16
+from luce_color import space, lab, cam16
 
 # Display P3's red, as sRGB sees it: out of gamut, so clamp for a preview.
 let red = space.convert(color.Color(1.0, 0.0, 0.0), space.display_p3, space.srgb)
@@ -47,7 +45,7 @@ is the perceptual space: lightness `l` with opponent axes `a` and `b`, both zero
 for a neutral gray.
 
 ```luce
-import luce_color.color
+from luce_color import color
 
 # A hovered surface: lift a base color toward the foreground in perceptual
 # lightness, keeping its hue. amount 0 is the base, 1 the reference lightness.
