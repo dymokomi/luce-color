@@ -2,12 +2,12 @@
 ## with a white, and a transfer function. `convert` is the processor chain OCIO
 ## would build for a pair of them — decode, matrix, adapt, matrix, encode —
 ## and `to_lab`/`to_appearance` take any space to the perceptual models.
-import math
-from luce_color.color import Color, Oklab, to_oklab
-import luce_color.transfer as transfer
-import luce_color.xyz as xyz
-import luce_color.lab as lab
-import luce_color.cam16 as cam16
+import luce_std.math
+from color import Color, Oklab, to_oklab
+import transfer
+import xyz
+import lab
+import cam16
 
 # mark: Types =================================================================
 

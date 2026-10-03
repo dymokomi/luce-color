@@ -1,8 +1,8 @@
 ## CIELAB and its polar form, the color differences built on them, and the
 ## polar form of Oklab. Lab needs a white: pass the one the XYZ is relative to.
-import math
-from luce_color.color import Oklab
-from luce_color.xyz import XYZ, Chromaticity, white_point, d65
+import luce_std.math
+from color import Oklab
+from xyz import XYZ, Chromaticity, white_point, d65
 
 # mark: Types =================================================================
 

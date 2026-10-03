@@ -2,8 +2,8 @@
 ## value — Photoshop's HSB) and HSL. Hue is degrees 0..360; the rest 0..1.
 ## These are conveniences for pickers, not color science: two colors a step
 ## apart in HSV need not look a step apart.
-import math
-from luce_color.color import Color
+import luce_std.math
+from color import Color
 
 # mark: Types =================================================================
 

@@ -1,8 +1,8 @@
 ## CIE XYZ, the hub every color space meets at, and the RGB spaces defined on
 ## it by their primaries and white: matrices are derived from chromaticities,
 ## never typed in, and whites are reconciled by Bradford adaptation.
-import math
-from luce_color.color import Color
+import luce_std.math
+from color import Color
 
 # mark: Types =================================================================
 

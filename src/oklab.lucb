@@ -3,10 +3,10 @@
 ## a lightness and hue can carry, and the gamut mapping that keeps hue and
 ## lightness while giving up chroma (CSS Color 4's approach), which is what a
 ## picker wants when a Lab or OkLCh edit leaves the display's gamut.
-import math
-from luce_color.color import Color, Oklab, to_oklab, to_color
-from luce_color.lab import LCh, oklab_to_oklch, oklch_to_oklab
-from luce_color.xyz import XYZ, Matrix3, apply
+import luce_std.math
+from color import Color, Oklab, to_oklab, to_color
+from lab import LCh, oklab_to_oklch, oklch_to_oklab
+from xyz import XYZ, Matrix3, apply
 
 # mark: XYZ ===================================================================
 

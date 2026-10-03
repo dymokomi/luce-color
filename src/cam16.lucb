@@ -2,8 +2,8 @@
 ## conditions — lightness J, chroma C, hue h, colorfulness M, saturation s,
 ## brightness Q — and CAM16-UCS, the uniform space built on it, whose Euclidean
 ## distance is a color difference. XYZ here is on the Y = 100 scale.
-import math
-from luce_color.xyz import XYZ, Matrix3, apply, invert
+import luce_std.math
+from xyz import XYZ, Matrix3, apply, invert
 
 # mark: Types =================================================================
 

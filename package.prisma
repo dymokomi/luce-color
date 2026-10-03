@@ -1,47 +1,16 @@
 #prisma 4.0
 def package "luce-color" {
     str owner = "dymokomi"
-    str version = "0.2.3"
+    str version = "0.3.0"
     str kind = "package"
     str language = "luce-base"
     str description = "Color science in Luce Base: XYZ with derived matrices and Bradford adaptation, sRGB/P3/Adobe/Rec.2020/ACES/ProPhoto spaces, sRGB/gamma/PQ/HLG curves, CIELAB with CIEDE2000, Oklab, CAM16 and CAM16-UCS, HSV/HSL, OCIO-style conversion."
     str readme = "README.md"
-
-    def export "color" {
-        str module = "luce_color.color"
-    }
-
-    def export "transfer" {
-        str module = "luce_color.transfer"
-    }
-
-    def export "xyz" {
-        str module = "luce_color.xyz"
-    }
-
-    def export "lab" {
-        str module = "luce_color.lab"
-    }
-
-    def export "cam16" {
-        str module = "luce_color.cam16"
-    }
-
-    def export "hsl" {
-        str module = "luce_color.hsl"
-    }
-
-    def export "space" {
-        str module = "luce_color.space"
-    }
-
-    def export "oklab" {
-        str module = "luce_color.oklab"
-    }
+    str[] public = ["cam16", "color", "hsl", "lab", "oklab", "space", "transfer", "xyz"]
 
     def dependency "luce-std" {
         str owner = "dymokomi"
-        str version = "^0.1.0"
+        str version = "^0.2.0"
         str path = "../luce-std"
     }
 }
