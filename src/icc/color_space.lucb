@@ -51,7 +51,7 @@ pub let primaries_rec470_system_bg: NamedPrimaries = NamedPrimaries(rx = 0.64, r
 pub let primaries_rec601: NamedPrimaries = NamedPrimaries(rx = 0.630, ry = 0.340, gx = 0.310, gy = 0.595, bx = 0.155, by = 0.070, wx = 0.3127, wy = 0.3290)
 ## SMPTE ST 240, value 7 (functionally the same as value 6).
 pub let primaries_smpte_st_240: NamedPrimaries = primaries_rec601
-## Generic film (colour filters using Illuminant C), value 8.
+## Generic film (color filters using Illuminant C), value 8.
 pub let primaries_generic_film: NamedPrimaries = NamedPrimaries(rx = 0.681, ry = 0.319, gx = 0.243, gy = 0.692, bx = 0.145, by = 0.049, wx = 0.310, wy = 0.316)
 ## Rec. ITU-R BT.2020-2, value 9.
 pub let primaries_rec2020: NamedPrimaries = NamedPrimaries(rx = 0.708, ry = 0.292, gx = 0.170, gy = 0.797, bx = 0.131, by = 0.046, wx = 0.3127, wy = 0.3290)
