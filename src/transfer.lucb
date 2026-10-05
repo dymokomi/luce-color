@@ -132,8 +132,8 @@ pub let srgb_table_steps: usize = 4096
 pub struct SrgbTable:
     var decoded: f32[]
 
-    pub static func create() -> SrgbTable!:
-        let decoded = try alloc f32[srgb_table_steps + 1] in memory.heap
+    pub func create() -> SrgbTable!:
+        let decoded = try new f32[srgb_table_steps + 1] --- in memory.heap
         for step in 0..<srgb_table_steps + 1:
             decoded[step] = (f32)srgb_decode((f64)step / (f64)srgb_table_steps)
         return SrgbTable(decoded = decoded)
@@ -149,7 +149,7 @@ pub struct SrgbTable:
         let f = at - (f32)step
         return self.decoded[step] + (self.decoded[step + 1] - self.decoded[step]) * f
 
-    pub mutating func destroy():
+    pub func destroy():
         if self.decoded.length > 0:
             free(self.decoded) in memory.heap
         var nothing: f32[]

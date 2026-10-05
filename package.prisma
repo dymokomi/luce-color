@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-color" {
     str owner = "dymokomi"
-    str version = "0.3.2"
+    str version = "0.4.0"
     str kind = "package"
     str language = "luce-base"
     str description = "Color science in Luce Base: XYZ with derived matrices and Bradford adaptation, sRGB/P3/Adobe/Rec.2020/ACES/ProPhoto spaces, sRGB/gamma/PQ/HLG curves, CIELAB with CIEDE2000, Oklab, CAM16 and CAM16-UCS, HSV/HSL, OCIO-style conversion."
@@ -10,7 +10,7 @@ def package "luce-color" {
 
     def dependency "luce-std" {
         str owner = "dymokomi"
-        str version = "^0.3.1"
+        str version = "^0.4.0"
         str path = "../luce-std"
     }
 }
