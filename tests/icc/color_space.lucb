@@ -1,0 +1,99 @@
+#==============================================================================================
+#
+#   tests/icc/color_space - Skia's color spaces, their steps, and the bridge
+#
+#==============================================================================================
+
+test "profiles become Skia's color spaces":
+    # A profile approximately sRGB's is sRGB.
+    let v4 = profile_space("ladybird-icc-v4.icc") else trap("a color space")
+    assert(v4.is_srgb())
+    # Tabulated curves close to sRGB's take sRGB's curve; the red-green swapped profile keeps
+    # its own gamut, its red and green columns swapped against sRGB's.
+    let swap = profile_space("wpt-swap-990000.icc") else trap("a color space")
+    assert(same_transfer_function(&swap.transfer_function, &tf_srgb) and not swap.is_srgb())
+    assert(near(swap.to_xyzd50.vals[1][0], srgb_to_xyzd50.vals[1][1], 0.001) and near(swap.to_xyzd50.vals[1][1], srgb_to_xyzd50.vals[1][0], 0.001))
+    # A 2.2 gamma (Adobe RGB) snaps to Skia's 2.2.
+    let adobe = profile_space("wpt-blending-red.icc") else trap("a color space")
+    assert(same_transfer_function(&adobe.transfer_function, &tf_2dot2))
+    # A profile that moves no color more than a unit from sRGB's is sRGB, cicp tag and all.
+    let near_srgb = profile_space("para-types.icc") else trap("a color space")
+    assert(near_srgb.is_srgb())
+    # Otherwise the cicp tag wins over the curves and matrix when full range without a matrix.
+    let tagged = profile_space("curv-gamma.icc") else trap("a color space")
+    let p3 = ColorSpace.cicp(12, 13) else trap("Display P3 has code points")
+    assert(tagged.same(&p3) and xyz_almost_equal(&p3.to_xyzd50, &gamut_display_p3))
+    # A lookup-only profile has no Skia color space.
+    assert(profile_space("mft2-lab.icc") == none)
+    assert(ColorSpace.cicp(1, 13) != none and ColorSpace.cicp(3, 13) == none and ColorSpace.cicp(1, 9) == none)
+    let srgb = ColorSpace.cicp(1, 13) else trap("sRGB has code points")
+    assert(srgb.is_srgb())
+
+test "MakeRGB snaps curves near sRGB's, 2.2 and linear":
+    let near_srgb = TransferFunction(g = 2.4001, a = tf_srgb.a, b = tf_srgb.b, c = tf_srgb.c, d = tf_srgb.d, e = 0.0, f = 0.0)
+    let srgb_gamut = gamut_srgb()
+    let snapped = ColorSpace.rgb(&near_srgb, &srgb_gamut) else trap("a color space")
+    assert(snapped.is_srgb())
+    let linear = ColorSpace.rgb(&tf_linear, &gamut_rec2020) else trap("a color space")
+    assert(same_transfer_function(&linear.transfer_function, &tf_linear))
+    let invalid = TransferFunction(g = -1.5, a = 0.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+    assert(ColorSpace.rgb(&invalid, &srgb_gamut) == none)
+    let profile = p3_space().to_profile()
+    assert(profile.has_trc and profile.has_to_xyzd50 and not profile.has_cicp)
+    let pq = ColorSpace(transfer_function = tf_pq, to_xyzd50 = gamut_rec2020)
+    let pq_profile = pq.to_profile()
+    assert(pq_profile.has_cicp and pq_profile.cicp.transfer_characteristics == 16 and pq_profile.cicp.color_primaries == 9)
+
+## The Skia color space of test profile `name`, or none.
+func profile_space(name: str) -> ColorSpace?:
+    let p = test_profile(name)
+    return ColorSpace.from_profile(&p)
+
+func p3_space() -> ColorSpace:
+    return ColorSpace.cicp(12, 13) else trap("Display P3 has code points")
+
+test "the steps between color spaces are Skia's":
+    let srgb = ColorSpace.srgb()
+    assert(Steps.make(&srgb, .premul, &srgb, .premul).is_identity())
+    assert(Steps.make(none, .premul, none, .premul).is_identity())
+    # Premultiplied to unpremultiplied needs no curve.
+    let unpremul = Steps.make(&srgb, .premul, &srgb, .unpremul)
+    assert(unpremul.flags.unpremul and not unpremul.flags.linearize and not unpremul.flags.premul)
+    let swap = profile_space("wpt-swap-990000.icc") else trap("a color space")
+    let steps = Steps.make(&swap, .premul, &srgb, .premul)
+    assert(steps.flags.unpremul and steps.flags.linearize and steps.flags.gamut_transform and steps.flags.encode and steps.flags.premul)
+    # The swapped profile's #990000 is sRGB's #009900.
+    let out = steps.apply([0.6, 0.0, 0.0, 1.0])
+    assert(near(out[0], 0.0, 0.002) and near(out[1], 0.6, 0.002) and near(out[2], 0.0, 0.002) and out[3] == 1.0)
+    # Same curves on both sides: linearize and encode are kept for the gamut, else skipped.
+    let p3 = p3_space()
+    let gamut_only = Steps.make(&p3, .opaque, &srgb, .premul)
+    assert(gamut_only.flags.linearize and gamut_only.flags.gamut_transform and not gamut_only.flags.unpremul and not gamut_only.flags.premul)
+    let red = gamut_only.apply([1.0, 0.0, 0.0, 1.0])
+    assert(red[0] > 1.0 and red[1] < 0.0)
+    # PQ scales by 10000 over its reference white.
+    let pq = ColorSpace(transfer_function = tf_pq, to_xyzd50 = gamut_srgb())
+    let hdr = Steps.make(&pq, .opaque, &srgb, .opaque)
+    assert(hdr.flags.gamut_transform and near(hdr.src_to_dst_matrix[0], 10000.0 / 203.0, 0.01))
+
+test "the bridge maps this library's curves and primaries":
+    let all: transfer.Transfer[7] = [.linear, .srgb, .gamma_18, .gamma_22, .gamma_24, .pq, .hlg]
+    for curve in all:
+        let tf = transfer_function(curve)
+        assert(transfer_of(&tf) == curve)
+    let srgb_tf = transfer_function(.srgb)
+    assert(same_transfer_function(&srgb_tf, &srgb_transfer_function))
+    let p3 = ColorSpace.from_space(space.display_p3) else trap("Display P3 converts")
+    let expected_p3 = p3_space()
+    assert(p3.same(&expected_p3))
+    let srgb = ColorSpace.from_space(space.srgb) else trap("sRGB converts")
+    assert(srgb.is_srgb())
+    let m = primaries_matrix(xyz.rec2020) else trap("Rec. 2020 has a matrix")
+    let back = Matrix3x3.from_matrix3(m.matrix3())
+    assert(same_matrix(&m, &back))
+    # Linear values survive a PQ round trip at 1 (10 000 cd/m2 in both conventions).
+    let pq = ColorSpace(transfer_function = transfer_function(.pq), to_xyzd50 = gamut_srgb())
+    let linear = ColorSpace.srgb_linear()
+    let steps = Steps.make(&pq, .opaque, &linear, .opaque)
+    let one = steps.apply([1.0, 1.0, 1.0, 1.0])
+    assert(near(one[0], 1.0, 0.001))

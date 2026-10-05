@@ -1,0 +1,453 @@
+#==============================================================================================
+#
+#   icc/transform - skcms_Transform: pixels from one profile and format to another
+#
+#   DESCRIPTION:
+#       Port of skcms.cc's skcms_Transform and what it calls to choose its ops: tf_is_gamma,
+#       select_curve_op and select_curve_ops (one op a channel, a matching red, green and
+#       blue fused into one), bytes_per_pixel, the CICP PQ and HLG transfer functions
+#       (set_reference_pq_ish_trc, set_sdr_hlg_ish_trc) and prep_for_destination. The ops
+#       run in transform_ops.lucb, one pixel at a time, as skcms's portable build runs them.
+#
+#       A source is read through its CICP PQ or HLG curve, else its A2B lookup, else its tone
+#       curves and matrix; a destination is written through its CICP PQ or HLG curve, else its
+#       B2A lookup, else the inverses of its parametric tone curves. Profiles that are the
+#       same (both left out, or the same pointer) only convert the pixel format.
+#
+#==============================================================================================
+
+# mark: Ops ====================================================================================
+
+## The ops of a transform (skcms_private::Op). The curve ops (gamma, tf, pq, hlg, hlginv,
+## table) apply to the channel a step names.
+enum Op:
+    load_a8
+    load_g8
+    load_ga88
+    load_4444
+    load_565
+    load_888
+    load_8888
+    load_1010102
+    load_101010x_xr
+    load_10101010_xr
+    load_161616le
+    load_16161616le
+    load_161616be
+    load_16161616be
+    load_hhh
+    load_hhhh
+    load_fff
+    load_ffff
+    swap_rb
+    clamp
+    invert
+    force_opaque
+    premul
+    unpremul
+    matrix_3x3
+    matrix_3x4
+    lab_to_xyz
+    xyz_to_lab
+    gamma
+    tf
+    pq
+    hlg
+    hlg_ootf_scale
+    hlginv
+    hlginv_ootf_scale
+    table
+    clut_a2b
+    clut_b2a
+    store_a8
+    store_g8
+    store_ga88
+    store_4444
+    store_565
+    store_888
+    store_8888
+    store_1010102
+    store_161616le
+    store_16161616le
+    store_161616be
+    store_16161616be
+    store_101010x_xr
+    store_10101010_xr
+    store_hhh
+    store_hhhh
+    store_fff
+    store_ffff
+
+## The channel a curve op applies to: red, green, blue, alpha, or red, green and blue.
+let channel_rgb: u8 = 4
+
+## One op and its context (skcms's program and context arrays side by side).
+struct Step:
+    var op: Op
+    var channel: u8
+    var tf: const TransferFunction*?
+    var curve: const Curve*?
+    var m33: const Matrix3x3*?
+    var m34: const Matrix3x4*?
+    var a2b: const A2B*?
+    var b2a: const B2A*?
+
+## A program of at most 32 steps.
+struct Program:
+    var steps: Step[32]
+    var count: usize
+
+    func add(op: Op):
+        self.steps[self.count] = Step(op = op)
+        self.count += 1
+
+    func add_tf(op: Op, channel: u8, tf: const TransferFunction*):
+        self.steps[self.count] = Step(op = op, channel = channel, tf = tf)
+        self.count += 1
+
+    func add_step(step: Step):
+        self.steps[self.count] = step
+        self.count += 1
+
+    ## add_curve_ops: the ops of `curves`, the first `count` channels.
+    func add_curve_ops(curves: const Curve[], count: usize):
+        var ops: Step[4] = ---
+        let used = select_curve_ops(curves, count, ops)
+        for i in 0..<used:
+            self.add_step(ops[i])
+
+# mark: Choosing curve ops =====================================================================
+
+## tf_is_gamma: a pure power.
+func tf_is_gamma(tf: const TransferFunction*) -> bool:
+    return tf.g > 0.0 and tf.a == 1.0 and tf.b == 0.0 and tf.c == 0.0 and tf.d == 0.0 and tf.e == 0.0 and tf.f == 0.0
+
+## select_curve_op: the op for one channel's curve, or none for a no-op (an identity gamma,
+## an invalid curve, or PQ and HLG, which skcms leaves to tone mapping).
+func select_curve_op(curve: const Curve*, channel: u8) -> Step?:
+    if curve.table_entries == 0:
+        let tf = &curve.parametric
+        if tf_is_gamma(tf):
+            if tf.g != 1.0:
+                return Step(op = .gamma, channel = channel, tf = tf)
+            return none
+        match tf.kind():
+            .invalid, .pq, .hlg: return none
+            .srgbish: return Step(op = .tf, channel = channel, tf = tf)
+            .pqish: return Step(op = .pq, channel = channel, tf = tf)
+            .hlgish: return Step(op = .hlg, channel = channel, tf = tf)
+            .hlginvish: return Step(op = .hlginv, channel = channel, tf = tf)
+    return Step(op = .table, channel = channel, curve = curve)
+
+## select_curve_ops: the channels in reverse order, then a trailing blue, green and red of
+## one kind with equal transfer functions fused into one op for all three.
+func select_curve_ops(curves: const Curve[], count: usize, ops: Step[]) -> usize:
+    var cursor: usize = 0
+    var index = count
+    while index > 0:
+        index -= 1
+        if let step = select_curve_op(&curves[index], (u8)index):
+            ops[cursor] = step
+            cursor += 1
+
+    # Identify separate B+G+R ops and fuse them into a single RGB op.
+    if cursor >= 3:
+        let r = &ops[cursor - 1]
+        let g = &ops[cursor - 2]
+        let b = &ops[cursor - 3]
+        let fusable = r.op == g.op and r.op == b.op and (r.op == .gamma or r.op == .tf or r.op == .pq or r.op == .hlg or r.op == .hlginv)
+        if fusable and r.channel == 0 and g.channel == 1 and b.channel == 2:
+            let rtf = r.tf else return cursor
+            let gtf = g.tf else return cursor
+            let btf = b.tf else return cursor
+            if same_transfer_function(rtf, gtf) and same_transfer_function(rtf, btf):
+                ops[cursor - 3].channel = channel_rgb
+                cursor -= 2
+    return cursor
+
+## bytes_per_pixel.
+pub func bytes_per_pixel(format: PixelFormat) -> usize:
+    match (u8)format >> 1:
+        0, 1: return 1
+        2, 3, 4: return 2
+        5: return 3
+        6, 7, 8: return 4
+        9: return 6
+        10: return 8
+        11: return 6
+        12: return 8
+        13: return 6
+        14: return 8
+        15: return 6
+        16: return 8
+        17: return 12
+        18: return 16
+        19: return 4
+        20: return 8
+        _: return 0
+
+# mark: CICP curves and destinations ===========================================================
+
+# See ITU-T H.273 Table 3 for the full list of codes.
+let transfer_cicp_id_pq: u8 = 16
+let transfer_cicp_id_hlg: u8 = 18
+
+func has_cicp_pq_trc(profile: const Profile*) -> bool:
+    return profile.has_cicp and profile.cicp.transfer_characteristics == transfer_cicp_id_pq
+
+func has_cicp_hlg_trc(profile: const Profile*) -> bool:
+    return profile.has_cicp and profile.cicp.transfer_characteristics == transfer_cicp_id_hlg
+
+## set_reference_pq_ish_trc: PQ scaled so that 1.0 maps to 10000 / 203, the scale W
+## distributed into A and B as W^(1/F).
+func reference_pq_ish_trc() -> TransferFunction:
+    var tf = TransferFunction.pqish(-107.0 / 128.0, 1.0, 32.0 / 2523.0, 2413.0 / 128.0, -2392.0 / 128.0, 8192.0 / 1305.0)
+    let w: f32 = 10000.0 / 203.0
+    let ws = powf_(w, 1.0 / tf.f)
+    tf.a = ws * tf.a
+    tf.b = ws * tf.b
+    return tf
+
+## set_sdr_hlg_ish_trc: the HLG inverse OETF scaled so that 1.0 maps to 1.0.
+func sdr_hlg_ish_trc() -> TransferFunction:
+    var tf = TransferFunction.hlgish(2.0, 2.0, 1.0 / 0.17883277, 0.28466892, 0.55991073)
+    tf.f = 1.0 / 12.0 - 1.0
+    return tf
+
+## What prep_for_destination found.
+struct Destination:
+    var from_xyzd50: Matrix3x3
+    var inverse: TransferFunction[3]
+    var using_b2a: bool
+    var using_hlg_ootf: bool
+
+## prep_for_destination: CICP PQ and HLG curves take precedence, then the B2A lookup, then
+## the inverses of parametric tone curves.
+func prep_for_destination(profile: const Profile*) -> Destination?:
+    var out = Destination()
+    var has_xyzd50 = false
+    if profile.has_to_xyzd50:
+        if let inverse = profile.to_xyzd50.invert():
+            out.from_xyzd50 = inverse
+            has_xyzd50 = true
+
+    if has_cicp_pq_trc(profile) and has_xyzd50:
+        let trc = reference_pq_ish_trc()
+        let inverse = trc.invert() else trap("a PQ-ish transfer function inverts")
+        out.inverse = [inverse, inverse, inverse]
+        return out
+    if has_cicp_hlg_trc(profile) and has_xyzd50:
+        let trc = sdr_hlg_ish_trc()
+        let inverse = trc.invert() else trap("an HLG-ish transfer function inverts")
+        out.inverse = [inverse, inverse, inverse]
+        out.using_hlg_ootf = true
+        return out
+
+    # Then prefer the B2A transformation.
+    if profile.has_b2a:
+        out.using_b2a = true
+        return out
+
+    # Finally use parametric transfer functions.
+    if not has_xyzd50 or not profile.has_trc:
+        return none
+    for i in 0..<(usize)3:
+        if profile.trc[i].table_entries != 0:
+            return none
+    for i in 0..<(usize)3:
+        out.inverse[i] = profile.trc[i].parametric.invert() else return none
+    return out
+
+# mark: The transform ==========================================================================
+
+## The load op of a format pair (`format >> 1`), or none for an unknown format.
+func load_op(pair: u8) -> Op?:
+    let ops: Op[21] = [.load_a8, .load_g8, .load_ga88, .load_565, .load_4444, .load_888, .load_8888, .load_8888, .load_1010102, .load_161616le, .load_16161616le, .load_161616be, .load_16161616be, .load_hhh, .load_hhhh, .load_hhh, .load_hhhh, .load_fff, .load_ffff, .load_101010x_xr, .load_10101010_xr]
+    if (usize)pair >= ops.length:
+        return none
+    return ops[(usize)pair]
+
+## The store op of a format pair.
+func store_op(pair: u8) -> Op?:
+    let ops: Op[21] = [.store_a8, .store_g8, .store_ga88, .store_565, .store_4444, .store_888, .store_8888, .store_8888, .store_1010102, .store_161616le, .store_16161616le, .store_161616be, .store_16161616be, .store_hhh, .store_hhhh, .store_hhh, .store_hhhh, .store_fff, .store_ffff, .store_101010x_xr, .store_10101010_xr]
+    if (usize)pair >= ops.length:
+        return none
+    return ops[(usize)pair]
+
+## Converts `count` pixels of `src` in `src_format`, `src_alpha` and `src_profile` into
+## `dst` in the destination's (skcms_Transform); a profile left out is sRGB. False when the
+## formats or profiles cannot be transformed or the buffers are too small. `dst` may be
+## `src` when both formats have the same size.
+pub func transform(src: const u8[], src_format: PixelFormat, src_alpha: AlphaFormat, src_profile: const Profile*?, dst: u8[], dst_format: PixelFormat, dst_alpha: AlphaFormat, dst_profile: const Profile*?, count: usize) -> bool:
+    let dst_bpp = bytes_per_pixel(dst_format)
+    let src_bpp = bytes_per_pixel(src_format)
+    if dst_bpp == 0 or src_bpp == 0:
+        return false
+    # Let's just refuse if the request is absurdly big.
+    if count > 2147483647 // dst_bpp or count > 2147483647 // src_bpp:
+        return false
+    if src.length < count * src_bpp or dst.length < count * dst_bpp:
+        return false
+    # We can't transform in place unless the PixelFormats are the same size.
+    if (const u8*)dst.data == src.data and dst_bpp != src_bpp:
+        return false
+
+    # Null profiles default to sRGB. Passing null for both is handy when doing format
+    # conversion; the profiles are then the same, as they are when they are one pointer.
+    let srgb = Profile.srgb()
+    let src_p: const Profile* = src_profile else &srgb
+    var dst_p: const Profile* = dst_profile else &srgb
+    var same = src_p == dst_p
+
+    var program = Program()
+    var src_alpha_format = src_alpha
+    var dst_alpha_format = dst_alpha
+
+    let src_pair = (u8)src_format >> 1
+    let load = load_op(src_pair) else return false
+    program.add(load)
+    if src_format == .rgba_8888_srgb or src_format == .bgra_8888_srgb:
+        program.add_tf(.tf, channel_rgb, &srgb_transfer_function)
+    if src_format == .rgb_hhh_norm or src_format == .rgba_hhhh_norm:
+        program.add(.clamp)
+    if ((u8)src_format & 1) == 1:
+        program.add(.swap_rb)
+
+    # When transforming to gray, stop at XYZ (by setting toXYZ to identity), then transform
+    # luminance (Y) by the destination transfer function. skcms compares the format pair
+    # with the formats G_8 and GA_88 themselves, so this is the pairs of GA_88 and
+    # ABGR_4444; its behaviour is kept.
+    let dst_pair = (u8)dst_format >> 1
+    var gray_dst_profile: Profile = ---
+    if dst_pair == (u8)PixelFormat.g_8 or dst_pair == (u8)PixelFormat.ga_88:
+        gray_dst_profile = *dst_p
+        let identity = identity_matrix()
+        gray_dst_profile.set_xyzd50(&identity)
+        dst_p = &gray_dst_profile
+        same = false
+
+    if src_p.data_color_space == signature_cmyk:
+        # Photoshop creates CMYK images as inverse CMYK. These happen to be the only ones
+        # we've _ever_ seen.
+        program.add(.invert)
+        # With CMYK, ignore the alpha type, to avoid changing K or conflating CMY with K.
+        src_alpha_format = .unpremul
+
+    if src_alpha_format == .opaque:
+        program.add(.force_opaque)
+    elif src_alpha_format == .premul_as_encoded:
+        program.add(.unpremul)
+
+    # The context of the ops that point into this frame.
+    var src_cicp_trc = identity_transfer_function
+    var destination = Destination()
+    var dst_curves: Curve[3] = [Curve(), Curve(), Curve()]
+    var dst_from_src = zero_matrix()
+
+    if not same:
+        # Track whether or not the A2B or B2A transforms are used. The CICP values take
+        # precedence over A2B and B2A.
+        var src_using_a2b = false
+        var src_using_hlg_ootf = false
+
+        destination = prep_for_destination(dst_p) else return false
+        for i in 0..<(usize)3:
+            dst_curves[i].parametric = destination.inverse[i]
+
+        if has_cicp_pq_trc(src_p) and src_p.has_to_xyzd50:
+            src_cicp_trc = reference_pq_ish_trc()
+            program.add_tf(.pq, channel_rgb, &src_cicp_trc)
+        elif has_cicp_hlg_trc(src_p) and src_p.has_to_xyzd50:
+            src_using_hlg_ootf = true
+            src_cicp_trc = sdr_hlg_ish_trc()
+            program.add_tf(.hlg, channel_rgb, &src_cicp_trc)
+        elif src_p.has_a2b:
+            src_using_a2b = true
+            if src_p.a2b.input_channels != 0:
+                program.add_curve_ops(src_p.a2b.input_curves, (usize)src_p.a2b.input_channels)
+                program.add(.clamp)
+                program.add_step(Step(op = .clut_a2b, a2b = &src_p.a2b))
+            if src_p.a2b.matrix_channels == 3:
+                program.add_curve_ops(src_p.a2b.matrix_curves, 3)
+                if not is_identity_3x4(&src_p.a2b.matrix):
+                    program.add_step(Step(op = .matrix_3x4, m34 = &src_p.a2b.matrix))
+            if src_p.a2b.output_channels == 3:
+                program.add_curve_ops(src_p.a2b.output_curves, 3)
+            if src_p.pcs == signature_lab:
+                program.add(.lab_to_xyz)
+        elif src_p.has_trc and src_p.has_to_xyzd50:
+            program.add_curve_ops(src_p.trc, 3)
+        else:
+            return false
+
+        # A2B sources are in XYZD50 by now, but TRC sources are still in their own gamut.
+        if destination.using_b2a:
+            # B2A needs its input in XYZD50, so transform TRC sources now.
+            if not src_using_a2b:
+                program.add_step(Step(op = .matrix_3x3, m33 = &src_p.to_xyzd50))
+                # Apply the HLG OOTF in XYZD50 space, if needed.
+                if src_using_hlg_ootf:
+                    program.add(.hlg_ootf_scale)
+            if dst_p.pcs == signature_lab:
+                program.add(.xyz_to_lab)
+            if dst_p.b2a.input_channels == 3:
+                program.add_curve_ops(dst_p.b2a.input_curves, 3)
+            if dst_p.b2a.matrix_channels == 3:
+                if not is_identity_3x4(&dst_p.b2a.matrix):
+                    program.add_step(Step(op = .matrix_3x4, m34 = &dst_p.b2a.matrix))
+                program.add_curve_ops(dst_p.b2a.matrix_curves, 3)
+            if dst_p.b2a.output_channels != 0:
+                program.add(.clamp)
+                program.add_step(Step(op = .clut_b2a, b2a = &dst_p.b2a))
+                program.add_curve_ops(dst_p.b2a.output_curves, (usize)dst_p.b2a.output_channels)
+        else:
+            # This is a TRC destination: transform to the destination gamut.
+            if src_using_hlg_ootf != destination.using_hlg_ootf:
+                # If just the src or the dst has an HLG OOTF then we will apply the OOTF in
+                # XYZD50 space. If both have one, they cancel.
+                if not src_using_a2b:
+                    program.add_step(Step(op = .matrix_3x3, m33 = &src_p.to_xyzd50))
+                if src_using_hlg_ootf:
+                    program.add(.hlg_ootf_scale)
+                if destination.using_hlg_ootf:
+                    program.add(.hlginv_ootf_scale)
+                program.add_step(Step(op = .matrix_3x3, m33 = &destination.from_xyzd50))
+            elif src_using_a2b:
+                # If the source is A2B then we are already in XYZD50. Just apply the
+                # xyz->dst matrix.
+                program.add_step(Step(op = .matrix_3x3, m33 = &destination.from_xyzd50))
+            else:
+                # There's a chance the source and destination gamuts are identical, in
+                # which case we can skip the gamut transform.
+                if not same_matrix(&dst_p.to_xyzd50, &src_p.to_xyzd50):
+                    # Concat the entire gamut transform into dst_from_src.
+                    dst_from_src = destination.from_xyzd50.concat(&src_p.to_xyzd50)
+                    program.add_step(Step(op = .matrix_3x3, m33 = &dst_from_src))
+
+            # Encode back to dst RGB using its parametric transfer functions.
+            program.add_curve_ops(dst_curves, 3)
+
+    # Clamp here before premul to make sure we're clamping to normalized values _and_ gamut,
+    # not just to values that fit in [0,1].
+    if (u8)dst_format < (u8)PixelFormat.rgb_hhh:
+        program.add(.clamp)
+
+    if dst_p.data_color_space == signature_cmyk:
+        # Photoshop creates CMYK images as inverse CMYK.
+        program.add(.invert)
+        # CMYK has no alpha channel, so make sure dstAlpha is a no-op.
+        dst_alpha_format = .unpremul
+
+    if dst_alpha_format == .opaque:
+        program.add(.force_opaque)
+    elif dst_alpha_format == .premul_as_encoded:
+        program.add(.premul)
+    if ((u8)dst_format & 1) == 1:
+        program.add(.swap_rb)
+    if dst_format == .rgba_8888_srgb or dst_format == .bgra_8888_srgb:
+        program.add_tf(.tf, channel_rgb, &srgb_inverse_transfer_function)
+    let store = store_op(dst_pair) else return false
+    program.add(store)
+
+    run_program(program.steps[..<program.count], src, dst, count, src_bpp, dst_bpp)
+    return true

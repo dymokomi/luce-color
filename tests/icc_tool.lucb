@@ -1,0 +1,322 @@
+## The icc module's oracle driver: what the port makes of ICC profiles, printed in the format
+## of the skcms oracle (luce-browser-tools/oracles/luce-color/icc), so the two compare line
+## for line.
+## `icc_tool PROFILE...` prints one block a profile; `icc_tool --formats PROFILE` sends the
+## test pixels through every pixel format; `icc_tool --spaces PROFILE...` prints the Skia
+## color space of each profile and the one Ladybird's Gfx::ColorSpace::load_from_icc_bytes
+## makes (the skia_oracle's `space` and `ladybird` lines).
+from luce_std import files
+import c
+import io
+import strings
+import icc
+
+# mark: Output ================================================================================
+
+## Standard output, buffered: each write to it flushes.
+var pending: u8[65536]
+var pending_used: usize
+
+func emit(text: fmt):
+    var scratch: u8[512]
+    let piece = strings.format(scratch, text) else trap("an output piece is too long")
+    if pending_used + piece.length > pending.length:
+        flush_out()
+    for b in piece.bytes:
+        pending[pending_used] = b
+        pending_used += 1
+
+func flush_out():
+    _ = io.stdout().write(pending[..<pending_used]) else 0
+    pending_used = 0
+
+# mark: Printing ==============================================================================
+
+func print_tf(tf: const icc.TransferFunction*):
+    emit(f" {tf.g.bits():08x} {tf.a.bits():08x} {tf.b.bits():08x} {tf.c.bits():08x} {tf.d.bits():08x} {tf.e.bits():08x} {tf.f.bits():08x}")
+
+## The offset of `part` in `buffer`.
+func offset_in(part: const u8[], buffer: const u8[]) -> usize:
+    return (usize)part.data - (usize)buffer.data
+
+func print_curve(label: str, index: usize, curve: const icc.Curve*, buffer: const u8[]):
+    emit(f"{label} {index} {curve.table_entries}")
+    if curve.table_entries == 0:
+        print_tf(&curve.parametric)
+    elif curve.table_8.length > 0:
+        emit(f" t8 {offset_in(curve.table_8, buffer)}")
+    else:
+        emit(f" t16 {offset_in(curve.table_16, buffer)}")
+    emit("\n")
+
+func print_m33(label: str, m: const icc.Matrix3x3*):
+    emit(label)
+    for r in 0..<(usize)3:
+        for col in 0..<(usize)3:
+            emit(f" {m.vals[r][col].bits():08x}")
+    emit("\n")
+
+func print_m34(label: str, m: const icc.Matrix3x4*):
+    emit(label)
+    for r in 0..<(usize)3:
+        for col in 0..<(usize)4:
+            emit(f" {m.vals[r][col].bits():08x}")
+    emit("\n")
+
+func print_bytes(label: str, data: const u8[]):
+    emit(label)
+    for i in 0..<data.length:
+        if i % 64 == 0:
+            emit("\n  ")
+        emit(f"{data[i]:02x}")
+    emit("\n")
+
+func print_floats(label: str, data: const u8[], count: usize):
+    emit(label)
+    for i in 0..<count:
+        emit("\n  " if i % 16 == 0 else " ")
+        let v = (u32)data[4 * i] | ((u32)data[4 * i + 1] << 8) | ((u32)data[4 * i + 2] << 16) | ((u32)data[4 * i + 3] << 24)
+        emit(f"{v:08x}")
+    emit("\n")
+
+## The deterministic test pixels, the oracle's LCG.
+func test_pixels(out: u8[]):
+    var s: u32 = 0x12345678
+    for i in 0..<out.length:
+        s = s *% 1664525 +% 1013904223
+        out[i] = (u8)(s >> 24)
+
+# mark: One profile ===========================================================================
+
+func dump(path: str):
+    let name = path_name(path)
+    let read = files.read((c.str)path) catch failure:
+        _ = failure
+        emit(f"profile {path}\nmissing\n")
+        return
+    defer read.release()
+    let data = read.value
+    emit(f"profile {name}\n")
+    let parsed = icc.parse(data)
+    if parsed == none:
+        emit("parse 0\n")
+        return
+    let p = parsed else return
+    emit("parse 1\n")
+    let buffer = p.buffer
+    emit(f"header {p.size} {p.data_color_space:08x} {p.pcs:08x} {p.tag_count}\n")
+    emit(f"flags {(i32)p.has_trc} {(i32)p.has_to_xyzd50} {(i32)p.has_a2b} {(i32)p.has_b2a} {(i32)p.has_cicp}\n")
+    if p.has_trc:
+        for i in 0..<(usize)3:
+            print_curve("trc", i, &p.trc[i], buffer)
+    if p.has_to_xyzd50:
+        print_m33("xyz", &p.to_xyzd50)
+    if p.has_a2b:
+        let a = &p.a2b
+        emit(f"a2b {a.input_channels} {a.matrix_channels} {a.output_channels} {a.grid_points[0]} {a.grid_points[1]} {a.grid_points[2]} {a.grid_points[3]}")
+        if a.input_channels != 0:
+            if a.grid_8.length > 0:
+                emit(f" g8 {offset_in(a.grid_8, buffer)}")
+            else:
+                emit(f" g16 {offset_in(a.grid_16, buffer)}")
+        emit("\n")
+        for i in 0..<(usize)a.input_channels:
+            print_curve("a2b_in", i, &a.input_curves[i], buffer)
+        for i in 0..<(usize)a.matrix_channels:
+            print_curve("a2b_m", i, &a.matrix_curves[i], buffer)
+        if a.matrix_channels != 0:
+            print_m34("a2b_matrix", &a.matrix)
+        for i in 0..<(usize)a.output_channels:
+            print_curve("a2b_out", i, &a.output_curves[i], buffer)
+    if p.has_b2a:
+        let b = &p.b2a
+        emit(f"b2a {b.input_channels} {b.matrix_channels} {b.output_channels} {b.grid_points[0]} {b.grid_points[1]} {b.grid_points[2]} {b.grid_points[3]}")
+        if b.output_channels != 0:
+            if b.grid_8.length > 0:
+                emit(f" g8 {offset_in(b.grid_8, buffer)}")
+            else:
+                emit(f" g16 {offset_in(b.grid_16, buffer)}")
+        emit("\n")
+        for i in 0..<(usize)b.input_channels:
+            print_curve("b2a_in", i, &b.input_curves[i], buffer)
+        for i in 0..<(usize)b.matrix_channels:
+            print_curve("b2a_m", i, &b.matrix_curves[i], buffer)
+        if b.matrix_channels != 0:
+            print_m34("b2a_matrix", &b.matrix)
+        for i in 0..<(usize)b.output_channels:
+            print_curve("b2a_out", i, &b.output_curves[i], buffer)
+    if p.has_cicp:
+        emit(f"cicp {p.cicp.color_primaries} {p.cicp.transfer_characteristics} {p.cicp.matrix_coefficients} {p.cicp.video_full_range_flag}\n")
+
+    if let chad = p.chad():
+        print_m33("chad", &chad)
+    if let white = p.white_point():
+        emit(f"wtpt {white[0].bits():08x} {white[1].bits():08x} {white[2].bits():08x}\n")
+    emit(f"channels {p.input_channel_count()}\n")
+
+    if p.has_trc:
+        for i in 0..<(usize)3:
+            if let found = p.trc[i].approximate():
+                let (tf, err) = found
+                emit(f"approx {i} 1")
+                print_tf(&tf)
+                emit(f" {err.bits():08x}\n")
+            else:
+                emit(f"approx {i} 0\n")
+        emit(f"inverse_srgb {(i32)p.trcs_are_approximate_inverse(&icc.srgb_inverse_transfer_function)}\n")
+    let srgb = icc.Profile.srgb()
+    emit(f"equal_srgb {(i32)icc.approximately_equal_profiles(&p, &srgb)}\n")
+
+    var usable = p
+    let u = usable.make_usable_as_destination()
+    emit(f"usable {(i32)u}")
+    if u and not usable.has_b2a:
+        for i in 0..<(usize)3:
+            print_tf(&usable.trc[i].parametric)
+    emit("\n")
+    var single = p
+    let s = single.make_usable_as_destination_with_single_curve()
+    emit(f"single {(i32)s}")
+    if s:
+        print_tf(&single.trc[0].parametric)
+    emit("\n")
+
+    let cmyk = p.data_color_space == icc.signature_cmyk
+    let input = icc.PixelFormat.rgba_8888 if cmyk else icc.PixelFormat.rgb_888
+    let n: usize = 256
+    var src: u8[1024] = ---
+    test_pixels(src)
+    var out8: u8[1024] = ---
+    var outf: u8[4096] = ---
+    var t = icc.transform(src, input, .unpremul, &p, out8, .rgba_8888, .unpremul, &srgb, n)
+    emit(f"to_srgb8 {(i32)t}")
+    if t:
+        print_bytes("", out8[..<n * 4])
+    else:
+        emit("\n")
+    t = icc.transform(src, input, .unpremul, &p, outf, .rgba_ffff, .unpremul, &srgb, n)
+    emit(f"to_srgbf {(i32)t}")
+    if t:
+        print_floats("", outf, n * 4)
+    else:
+        emit("\n")
+    t = icc.transform(src, input if cmyk else .rgba_8888, .unpremul if cmyk else .premul_as_encoded, &p, out8, .bgra_8888, .premul_as_encoded, &srgb, n)
+    emit(f"to_srgb_premul {(i32)t}")
+    if t:
+        print_bytes("", out8[..<n * 4])
+    else:
+        emit("\n")
+    let xyzd50 = icc.Profile.xyzd50()
+    t = icc.transform(src, input, .opaque, &p, outf, .rgb_fff, .opaque, &xyzd50, n)
+    emit(f"to_xyz {(i32)t}")
+    if t:
+        print_floats("", outf, n * 3)
+    else:
+        emit("\n")
+    if u:
+        t = icc.transform(src, .rgba_8888, .unpremul, &srgb, out8, .rgba_8888 if cmyk else .rgb_888, .unpremul, &usable, n)
+        emit(f"from_srgb {(i32)t}")
+        if t:
+            print_bytes("", out8[..<n * (4 if cmyk else 3)])
+        else:
+            emit("\n")
+
+## The file name of a path.
+func path_name(path: str) -> str:
+    let bytes = path.bytes
+    var start: usize = 0
+    for i in 0..<bytes.length:
+        if bytes[i] == '/':
+            start = i + 1
+    return (str)bytes[start..]
+
+# mark: Color spaces =========================================================================
+
+func print_space(label: str, found: icc.ColorSpace?):
+    if let cs = found:
+        emit(f"{label} 1")
+        print_tf(&cs.transfer_function)
+        for r in 0..<(usize)3:
+            for col in 0..<(usize)3:
+                emit(f" {cs.to_xyzd50.vals[r][col].bits():08x}")
+        emit("\n")
+    else:
+        emit(f"{label} 0\n")
+
+func spaces(path: str):
+    let read = files.read((c.str)path) else return
+    defer read.release()
+    emit(f"profile {path_name(path)}\n")
+    let parsed = icc.parse(read.value)
+    if parsed == none:
+        emit("parse 0\n")
+        return
+    let p = parsed else return
+    let space = icc.ColorSpace.from_profile(&p)
+    print_space("space", space)
+    # Gfx::ColorSpace::load_from_icc_bytes: the skcms_ApproximateCurve fallback.
+    var ladybird = space
+    if ladybird == none and p.has_trc and p.has_to_xyzd50:
+        if let found = p.trc[0].approximate():
+            let (tf, err) = found
+            _ = err
+            ladybird = icc.ColorSpace.rgb(&tf, &p.to_xyzd50)
+    print_space("ladybird", ladybird)
+
+# mark: Every pixel format ====================================================================
+
+func formats(path: str):
+    let read = files.read((c.str)path) else return
+    defer read.release()
+    let p = icc.parse(read.value) else return
+    let srgb = icc.Profile.srgb()
+    let n: usize = 64
+    var src: u8[1024] = ---
+    test_pixels(src)
+    # Floats in about -0.18..1.24, for the float and half sources.
+    var fsrc: u8[1024] = ---
+    for i in 0..<n * 4:
+        let v = ((f32)(i32)src[i] - 32.0) / 180.0
+        let b = v.bits()
+        fsrc[4 * i] = (u8)b
+        fsrc[4 * i + 1] = (u8)(b >> 8)
+        fsrc[4 * i + 2] = (u8)(b >> 16)
+        fsrc[4 * i + 3] = (u8)(b >> 24)
+    var out: u8[1024] = ---
+    let alphas: icc.AlphaFormat[3] = [.opaque, .unpremul, .premul_as_encoded]
+    for code in 0..<(u8)42:
+        let format = (icc.PixelFormat)code
+        let source: const u8[] = fsrc if code >= 34 and code <= 37 else src
+        for alpha in 0..<(usize)3:
+            let t = icc.transform(source, format, alphas[alpha], &p, out, .rgba_ffff, .unpremul, &srgb, n)
+            emit(f"load {code} {alpha} {(i32)t}")
+            if t:
+                print_floats("", out, n * 4)
+            else:
+                emit("\n")
+    var usable = p
+    if not usable.make_usable_as_destination():
+        usable = srgb
+    for code in 0..<(u8)42:
+        let format = (icc.PixelFormat)code
+        for alpha in 0..<(usize)3:
+            for i in 0..<out.length:
+                out[i] = 0
+            let t = icc.transform(fsrc, .rgba_ffff, .unpremul, &srgb, out, format, alphas[alpha], &usable, n)
+            emit(f"store {code} {alpha} {(i32)t}")
+            if t:
+                print_bytes("", out)
+            else:
+                emit("\n")
+
+pub func main(arguments: str[]) -> i32:
+    if arguments.length >= 3 and arguments[1] == "--formats":
+        formats(arguments[2])
+    elif arguments.length >= 2 and arguments[1] == "--spaces":
+        for i in 2..<arguments.length:
+            spaces(arguments[i])
+    else:
+        for i in 1..<arguments.length:
+            dump(arguments[i])
+    flush_out()
+    return 0

@@ -1,0 +1,293 @@
+#==============================================================================================
+#
+#   icc/curve - curves: their value, round trips through an inverse, and fitting a transfer
+#               function to a table
+#
+#   DESCRIPTION:
+#       Port of skcms.cc's eval_curve, skcms_MaxRoundtripError, skcms_AreApproximateInverses,
+#       fit_linear, canonicalize_identity and the curve approximation: skcms_ApproximateCurve
+#       with rg_nonlinear, gauss_newton_step, max_roundtrip_error_checked and fit_nonlinear.
+#
+#       Fitting approximates a table with tf(x) = cx + f below d and (ax + b)^g + e above,
+#       with both pieces meeting at d. For a couple of tolerances it fits c, d, f to as many
+#       points as the tolerance allows (fit_linear), inverts them, fits g, a, b by
+#       Gauss-Newton to the inverse of the table (fit_nonlinear), and keeps the parameters
+#       with the least maximum round-trip error.
+#
+#==============================================================================================
+
+# mark: Evaluation =============================================================================
+
+## A big-endian 16-bit value at `at`.
+func read_be16(data: const u8[], at: usize) -> u32:
+    return ((u32)data[at] << 8) | (u32)data[at + 1]
+
+extend Curve:
+    ## The curve at `x` (eval_curve): a table is read at x clamped to 0..1, interpolating
+    ## linearly between neighbouring entries.
+    pub func eval(x: f32) -> f32:
+        if self.table_entries == 0:
+            return self.parametric.eval(x)
+
+        let ix = fmaxf_(0.0, fminf_(x, 1.0)) * (f32)(self.table_entries - 1)
+        let lo = (usize)(i32)ix
+        let hi = (usize)(i32)minus_1_ulp(ix + 1.0)
+        let t = ix - (f32)lo
+
+        var l: f32 = 0.0
+        var h: f32 = 0.0
+        if self.table_8.length > 0:
+            l = (f32)self.table_8[lo] * (1.0 / 255.0)
+            h = (f32)self.table_8[hi] * (1.0 / 255.0)
+        else:
+            l = (f32)read_be16(self.table_16, 2 * lo) * (1.0 / 65535.0)
+            h = (f32)read_be16(self.table_16, 2 * hi) * (1.0 / 65535.0)
+        return l + (h - l) * t
+
+    ## The largest |x - inv_tf(curve(x))| over max(table entries, 256) evenly spaced x
+    ## (skcms_MaxRoundtripError).
+    pub func max_roundtrip_error(inv_tf: const TransferFunction*) -> f32:
+        let n: u32 = self.table_entries if self.table_entries > 256 else 256
+        let dx = 1.0 / (f32)(n - 1)
+        var err: f32 = 0.0
+        for i in 0..<n:
+            let x = (f32)i * dx
+            let y = self.eval(x)
+            err = fmaxf_(err, fabsf_(x - inv_tf.eval(y)))
+        return err
+
+    ## Whether `inv_tf` undoes the curve to within 1/512 (skcms_AreApproximateInverses).
+    pub func are_approximate_inverses(inv_tf: const TransferFunction*) -> bool:
+        return self.max_roundtrip_error(inv_tf) < 1.0 / 512.0
+
+    ## The parametric transfer function closest to a tabulated curve and its maximum
+    ## round-trip error (skcms_ApproximateCurve), or none for a parametric curve, a table
+    ## of fewer than two entries, or one no sRGB-ish function fits.
+    pub func approximate() -> (TransferFunction, f32)?:
+        if self.table_entries == 0:
+            # No point approximating an skcms_TransferFunction with an skcms_TransferFunction!
+            return none
+        if self.table_entries == 1 or self.table_entries > 2147483647:
+            # We need at least two points, and must put some reasonable cap on the maximum.
+            return none
+
+        let n = (i32)self.table_entries
+        let dx = 1.0 / (f32)(n - 1)
+
+        var max_error = infinity_
+        var approx = TransferFunction(g = 0.0, a = 0.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+        let tolerances: f32[2] = [1.5 / 65535.0, 1.0 / 512.0]
+        for tolerance in tolerances:
+            var tf = TransferFunction(g = 0.0, a = 0.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+
+            # It's problematic to fit curves with non-zero f, so always force it to zero.
+            tf.f = 0.0
+            let fit = fit_linear(&self, n, tolerance, false)
+            let l = fit.points
+            tf.c = fit.c
+            tf.d = fit.d
+
+            if l == n:
+                # If the entire data set was linear, move the coefficients to the nonlinear
+                # portion with G == 1. This lets us use a canonical representation with d == 0.
+                tf.g = 1.0
+                tf.a = tf.c
+                tf.b = tf.f
+                tf.c = 0.0
+                tf.d = 0.0
+                tf.e = 0.0
+                tf.f = 0.0
+            elif l == n - 1:
+                # Degenerate case with only two points in the nonlinear segment. Solve directly.
+                tf.g = 1.0
+                tf.a = (self.eval((f32)(n - 1) * dx) - self.eval((f32)(n - 2) * dx)) / dx
+                tf.b = self.eval((f32)(n - 2) * dx) - tf.a * (f32)(n - 2) * dx
+                tf.e = 0.0
+            else:
+                # Start by guessing a gamma-only curve through the midpoint.
+                let mid = (l + n) // 2
+                let mid_x = (f32)mid / (f32)(n - 1)
+                let mid_y = self.eval(mid_x)
+                tf.g = log2f_(mid_y) / log2f_(mid_x)
+                tf.a = 1.0
+                tf.b = 0.0
+                tf.e = tf.c * tf.d + tf.f - powf_(tf.a * tf.d + tf.b, tf.g)
+
+                var tf_inv = tf.invert() else continue
+                if not fit_nonlinear(&self, l, n, &tf_inv):
+                    continue
+                # We fit tf_inv, so calculate tf to keep in sync. fit_nonlinear() should
+                # guarantee invertibility.
+                tf = tf_inv.invert() else continue
+
+            # We'd better have a sane, sRGB-ish TF by now.
+            if tf.kind() != .srgbish:
+                continue
+
+            # We find our error by roundtripping the table through tf_inv. We can't
+            # guarantee that tf is invertible, so re-verify that here.
+            let tf_inv = tf.invert() else continue
+            let err = self.max_roundtrip_error(&tf_inv)
+            if max_error > err:
+                max_error = err
+                approx = tf
+        if not isfinitef_(max_error):
+            return none
+        return (approx, max_error)
+
+# mark: Fitting ================================================================================
+
+## What fit_linear found: the number of points on the line, and its c, d and f.
+struct LinearFit:
+    var points: i32
+    var c: f32
+    var d: f32
+    var f: f32
+
+## fit_linear: fits the first points of the curve to the line cx + f (f fitted only when
+## `fit_f`, else 0), as far as `tol` allows, walking the range of slopes that keep every
+## point within tolerance until it empties.
+func fit_linear(curve: const Curve*, n: i32, tol: f32, fit_f: bool) -> LinearFit:
+    let dx = 1.0 / (f32)(n - 1)
+    var fit = LinearFit(points = 1, c = 0.0, d = 0.0, f = 0.0)
+    if fit_f:
+        fit.f = curve.eval(0.0)
+
+    var slope_min = -infinity_
+    var slope_max = infinity_
+    for i in 1..<n:
+        let x = (f32)i * dx
+        let y = curve.eval(x)
+
+        let slope_max_i = (y + tol - fit.f) / x
+        let slope_min_i = (y - tol - fit.f) / x
+        if slope_max_i < slope_min or slope_max < slope_min_i:
+            # Slope intervals would no longer overlap.
+            break
+        slope_max = fminf_(slope_max, slope_max_i)
+        slope_min = fmaxf_(slope_min, slope_min_i)
+
+        let cur_slope = (y - fit.f) / x
+        if slope_min <= cur_slope and cur_slope <= slope_max:
+            fit.points = i + 1
+            fit.c = cur_slope
+
+    # Set D to the last point that met our tolerance.
+    fit.d = (f32)(fit.points - 1) * dx
+    return fit
+
+## canonicalize_identity: an identity table becomes the identity transfer function.
+func canonicalize_identity(curve: Curve*):
+    if curve.table_entries > 0 and curve.table_entries <= 2147483647:
+        let n = (i32)curve.table_entries
+        let fit = fit_linear(curve, n, 1.0 / (f32)(2 * n), true)
+        if fit.points == n and fit.c == 1.0 and fit.f == 0.0:
+            var empty: const u8[]
+            curve.table_entries = 0
+            curve.table_8 = empty
+            curve.table_16 = empty
+            curve.parametric = identity_transfer_function
+
+## rg_nonlinear: the residual of round-tripping curve(x) through the inverse of the
+## nonlinear piece of `tf`, and its gradient in g, a and b.
+func rg_nonlinear(x: f32, curve: const Curve*, tf: const TransferFunction*, dfdp: f32[]) -> f32:
+    let y = curve.eval(x)
+    let g = tf.g
+    let a = tf.a
+    let b = tf.b
+    let c = tf.c
+    let d = tf.d
+    let f = tf.f
+
+    let big_y = fmaxf_(a * y + b, 0.0)
+    let big_d = a * d + b
+
+    # The gradient.
+    dfdp[0] = logf_(big_y) * powf_(big_y, g) - logf_(big_d) * powf_(big_d, g)
+    dfdp[1] = y * g * powf_(big_y, g - 1.0) - d * g * powf_(big_d, g - 1.0)
+    dfdp[2] = g * powf_(big_y, g - 1.0) - g * powf_(big_d, g - 1.0)
+
+    # The residual.
+    let f_inv = powf_(big_y, g) - powf_(big_d, g) + c * d + f
+    return x - f_inv
+
+## gauss_newton_step: P' = P + (Jf^T Jf)^-1 Jf^T r(P) over N samples from x0 by dx, for
+## P = (g, a, b); false when the step fails or leaves the parameters non-finite.
+func gauss_newton_step(curve: const Curve*, tf: TransferFunction*, x0: f32, dx: f32, n: i32) -> bool:
+    var lhs = zero_matrix()
+    var rhs = Vector3(vals = [0.0, 0.0, 0.0])
+
+    # Evaluate Jf once per sample, updating lhs and rhs together.
+    for i in 0..<n:
+        let x = x0 + (f32)i * dx
+        var dfdp: f32[3] = [0.0, 0.0, 0.0]
+        let resid = rg_nonlinear(x, curve, tf, dfdp)
+        for r in 0..<(usize)3:
+            for c in 0..<(usize)3:
+                lhs.vals[r][c] += dfdp[r] * dfdp[c]
+            rhs.vals[r] += dfdp[r] * resid
+
+    # If any of the 3 P parameters are unused, this matrix will be singular. Detect those
+    # cases and fix them up to identity instead, so we can invert.
+    for k in 0..<(usize)3:
+        if lhs.vals[0][k] == 0.0 and lhs.vals[1][k] == 0.0 and lhs.vals[2][k] == 0.0 and lhs.vals[k][0] == 0.0 and lhs.vals[k][1] == 0.0 and lhs.vals[k][2] == 0.0:
+            lhs.vals[k][k] = 1.0
+
+    let lhs_inv = lhs.invert() else return false
+    let dp = mv_mul(&lhs_inv, &rhs)
+    tf.g += dp.vals[0]
+    tf.a += dp.vals[1]
+    tf.b += dp.vals[2]
+    return isfinitef_(tf.g) and isfinitef_(tf.a) and isfinitef_(tf.b)
+
+## max_roundtrip_error_checked: the round-trip error through the inverse of the inverse of
+## `tf_inv`, or infinity when either does not invert.
+func max_roundtrip_error_checked(curve: const Curve*, tf_inv: const TransferFunction*) -> f32:
+    let tf = tf_inv.invert() else return infinity_
+    if tf.kind() != .srgbish:
+        return infinity_
+    let tf_inv_again = tf.invert() else return infinity_
+    return curve.max_roundtrip_error(&tf_inv_again)
+
+## fixup_tf of fit_nonlinear: a must stay non-negative, ad + b is lifted to 0 when it went
+## negative, and e keeps the pieces meeting at d.
+func fixup_tf(tf: TransferFunction*) -> bool:
+    if tf.a < 0.0:
+        return false
+    if tf.a * tf.d + tf.b < 0.0:
+        tf.b = -tf.a * tf.d
+    tf.e = tf.c * tf.d + tf.f - powf_(tf.a * tf.d + tf.b, tf.g)
+    return isfinitef_(tf.e)
+
+## fit_nonlinear: fits the points in [L, N) to the nonlinear piece of `tf`.
+func fit_nonlinear(curve: const Curve*, l: i32, n: i32, tf: TransferFunction*) -> bool:
+    if not fixup_tf(tf):
+        return false
+
+    # No matter where we start, dx should always represent N even steps from 0 to 1.
+    let dx = 1.0 / (f32)(n - 1)
+
+    var best_tf = *tf
+    var best_max_error = infinity_
+
+    # Need this or several curves get worse... *sigh*
+    let init_error = max_roundtrip_error_checked(curve, tf)
+    if init_error < best_max_error:
+        best_max_error = init_error
+        best_tf = *tf
+
+    # As far as we can tell, 1 Gauss-Newton step won't converge, and 3 steps is no better
+    # than 2.
+    for j in 0..<8:
+        _ = j
+        if not gauss_newton_step(curve, tf, (f32)l * dx, dx, n - l) or not fixup_tf(tf):
+            *tf = best_tf
+            return isfinitef_(best_max_error)
+
+        let max_error = max_roundtrip_error_checked(curve, tf)
+        if max_error < best_max_error:
+            best_max_error = max_error
+            best_tf = *tf
+
+    *tf = best_tf
+    return isfinitef_(best_max_error)

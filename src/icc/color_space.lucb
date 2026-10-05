@@ -1,0 +1,348 @@
+#==============================================================================================
+#
+#   icc/color_space - Skia's color spaces: a transfer function and a gamut to XYZ D50
+#
+#   DESCRIPTION:
+#       Port of the parts of Skia's SkColorSpace (src/core/SkColorSpace.cpp,
+#       src/core/SkColorSpacePriv.h, include/core/SkColorSpace.h) that turn a profile or code
+#       points into the color space an image is drawn in: the named primaries, transfer
+#       functions and gamuts with their ITU-T H.273 code points (SkNamedPrimaries,
+#       SkNamedTransferFn, SkNamedGamut), SkColorSpacePrimaries::toXYZD50,
+#       SkColorSpace::MakeRGB (which snaps nearly-sRGB, nearly-2.2 and nearly-linear curves to
+#       the named ones), MakeCICP, Make from a profile, the lazily inverted fields,
+#       gamutTransformTo and toProfile. Skia's hashes are bitwise comparisons here, and its
+#       sRGB singletons are values compared by their bits.
+#
+#==============================================================================================
+
+## A color space as Skia keeps one (SkColorSpace): the transfer function from encoded to
+## linear values, and the matrix from linear values to XYZ D50.
+pub struct ColorSpace:
+    pub var transfer_function: TransferFunction
+    pub var to_xyzd50: Matrix3x3
+
+## The xy chromaticities of three primaries and a white (SkColorSpacePrimaries).
+pub struct NamedPrimaries:
+    pub var rx: f32
+    pub var ry: f32
+    pub var gx: f32
+    pub var gy: f32
+    pub var bx: f32
+    pub var by: f32
+    pub var wx: f32
+    pub var wy: f32
+
+    ## The matrix to XYZ D50 of these primaries (SkColorSpacePrimaries::toXYZD50).
+    pub func to_xyzd50() -> Matrix3x3?:
+        return primaries_to_xyzd50(self.rx, self.ry, self.gx, self.gy, self.bx, self.by, self.wx, self.wy)
+
+# mark: Named primaries ========================================================================
+
+# Color primaries defined by ITU-T H.273, table 2 (SkNamedPrimaries), named by the first
+# specification referenced in the value's row.
+
+## Rec. ITU-R BT.709-6, value 1.
+pub let primaries_rec709: NamedPrimaries = NamedPrimaries(rx = 0.64, ry = 0.33, gx = 0.3, gy = 0.6, bx = 0.15, by = 0.06, wx = 0.3127, wy = 0.329)
+## Rec. ITU-R BT.470-6 System M (historical), value 4.
+pub let primaries_rec470_system_m: NamedPrimaries = NamedPrimaries(rx = 0.67, ry = 0.33, gx = 0.21, gy = 0.71, bx = 0.14, by = 0.08, wx = 0.31, wy = 0.316)
+## Rec. ITU-R BT.470-6 System B, G (historical), value 5.
+pub let primaries_rec470_system_bg: NamedPrimaries = NamedPrimaries(rx = 0.64, ry = 0.33, gx = 0.29, gy = 0.60, bx = 0.15, by = 0.06, wx = 0.3127, wy = 0.3290)
+## Rec. ITU-R BT.601-7 525, value 6.
+pub let primaries_rec601: NamedPrimaries = NamedPrimaries(rx = 0.630, ry = 0.340, gx = 0.310, gy = 0.595, bx = 0.155, by = 0.070, wx = 0.3127, wy = 0.3290)
+## SMPTE ST 240, value 7 (functionally the same as value 6).
+pub let primaries_smpte_st_240: NamedPrimaries = primaries_rec601
+## Generic film (colour filters using Illuminant C), value 8.
+pub let primaries_generic_film: NamedPrimaries = NamedPrimaries(rx = 0.681, ry = 0.319, gx = 0.243, gy = 0.692, bx = 0.145, by = 0.049, wx = 0.310, wy = 0.316)
+## Rec. ITU-R BT.2020-2, value 9.
+pub let primaries_rec2020: NamedPrimaries = NamedPrimaries(rx = 0.708, ry = 0.292, gx = 0.170, gy = 0.797, bx = 0.131, by = 0.046, wx = 0.3127, wy = 0.3290)
+## SMPTE ST 428-1, value 10.
+pub let primaries_smpte_st_428_1: NamedPrimaries = NamedPrimaries(rx = 1.0, ry = 0.0, gx = 0.0, gy = 1.0, bx = 0.0, by = 0.0, wx = 1.0 / 3.0, wy = 1.0 / 3.0)
+## SMPTE RP 431-2, value 11.
+pub let primaries_smpte_rp_431_2: NamedPrimaries = NamedPrimaries(rx = 0.680, ry = 0.320, gx = 0.265, gy = 0.690, bx = 0.150, by = 0.060, wx = 0.314, wy = 0.351)
+## SMPTE EG 432-1, value 12 (Display P3's).
+pub let primaries_smpte_eg_432_1: NamedPrimaries = NamedPrimaries(rx = 0.680, ry = 0.320, gx = 0.265, gy = 0.690, bx = 0.150, by = 0.060, wx = 0.3127, wy = 0.3290)
+## Value 22, which no industry specification is identified for (sometimes called EBU 3213-E,
+## though that document doesn't specify these values).
+pub let primaries_itu_t_h273_value22: NamedPrimaries = NamedPrimaries(rx = 0.630, ry = 0.340, gx = 0.295, gy = 0.605, bx = 0.155, by = 0.077, wx = 0.3127, wy = 0.3290)
+## ProPhoto RGB (CSS Color 4's prophoto-rgb).
+pub let primaries_prophoto_rgb: NamedPrimaries = NamedPrimaries(rx = 0.7347, ry = 0.2653, gx = 0.1596, gy = 0.8404, bx = 0.0366, by = 0.0001, wx = 0.34567, wy = 0.35850)
+
+## Value 2: "characteristics are unknown or are determined by the application", in practice
+## the profile's own matrix or curves.
+pub let cicp_application_defined: u8 = 2
+
+## The primaries of ITU-T H.273 color primaries code `id` (SkNamedPrimaries::GetCicp).
+pub func cicp_primaries(id: u8) -> NamedPrimaries?:
+    match id:
+        1: return primaries_rec709
+        4: return primaries_rec470_system_m
+        5: return primaries_rec470_system_bg
+        6: return primaries_rec601
+        7: return primaries_smpte_st_240
+        8: return primaries_generic_film
+        9: return primaries_rec2020
+        10: return primaries_smpte_st_428_1
+        11: return primaries_smpte_rp_431_2
+        12: return primaries_smpte_eg_432_1
+        22: return primaries_itu_t_h273_value22
+        _: return none
+
+## The code of the named primaries whose matrix is within Skia's tolerance of `m`
+## (SkNamedPrimaries::GetCicpFromMatrix).
+pub func cicp_primaries_from_matrix(m: const Matrix3x3*) -> u8?:
+    let ids: u8[11] = [1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 22]
+    for id in ids:
+        let primaries = cicp_primaries(id) else continue
+        if let table_m = primaries.to_xyzd50():
+            if xyz_almost_equal(m, &table_m):
+                return id
+    return none
+
+# mark: Named transfer functions ===============================================================
+
+# SkNamedTransferFn, as { g, a, b, c, d, e, f }.
+
+## sRGB, bitwise skcms's.
+pub let tf_srgb: TransferFunction = srgb_transfer_function
+pub let tf_2dot2: TransferFunction = TransferFunction(g = 2.2, a = 1.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+pub let tf_rec2020: TransferFunction = TransferFunction(g = 2.22222, a = 0.909672, b = 0.0903276, c = 0.222222, d = 0.0812429, e = 0.0, f = 0.0)
+## Rec. ITU-R BT.709-6, value 1, following the BT.1886 reference EOTF that H.273's note 1
+## suggests for values 1, 6, 14 and 15.
+pub let tf_rec709: TransferFunction = TransferFunction(g = 2.4, a = 1.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+## Rec. ITU-R BT.470-6 System M (historical), assumed display gamma 2.2, value 4.
+pub let tf_rec470_system_m: TransferFunction = TransferFunction(g = 2.2, a = 1.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+## Rec. ITU-R BT.470-6 System B, G (historical), assumed display gamma 2.8, value 5.
+pub let tf_rec470_system_bg: TransferFunction = TransferFunction(g = 2.8, a = 1.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+## Rec. ITU-R BT.601-7, value 6, as value 1.
+pub let tf_rec601: TransferFunction = tf_rec709
+## SMPTE ST 240, value 7.
+pub let tf_smpte_st_240: TransferFunction = TransferFunction(g = 2.222222222222, a = 0.899626676224, b = 0.100373323776, c = 0.25, d = 0.091286342118, e = 0.0, f = 0.0)
+## Linear, value 8.
+pub let tf_linear: TransferFunction = TransferFunction(g = 1.0, a = 1.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+## IEC 61966-2-4, value 11, as value 1 (but explicitly extended).
+pub let tf_iec61966_2_4: TransferFunction = tf_rec709
+## IEC 61966-2-1 sRGB, value 13.
+pub let tf_iec61966_2_1: TransferFunction = srgb_transfer_function
+## Rec. ITU-R BT.2020-2 (10-bit and 12-bit systems), values 14 and 15, as value 1.
+pub let tf_rec2020_10bit: TransferFunction = tf_rec709
+pub let tf_rec2020_12bit: TransferFunction = tf_rec709
+## Rec. ITU-R BT.2100-2 perceptual quantization (PQ), value 16, reference white 203 nits.
+pub let tf_pq: TransferFunction = TransferFunction(g = -5.0, a = 203.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+## SMPTE ST 428-1, value 17.
+pub let tf_smpte_st_428_1: TransferFunction = TransferFunction(g = 2.6, a = 1.034080527699, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+## Rec. ITU-R BT.2100-2 hybrid log-gamma (HLG), value 18: reference white 203 nits, peak
+## 1000 nits, system gamma 1.2.
+pub let tf_hlg: TransferFunction = TransferFunction(g = -6.0, a = 203.0, b = 1000.0, c = 1.2, d = 0.0, e = 0.0, f = 0.0)
+## ProPhoto RGB's gamma 1.8, and A98 RGB's 2.2 (CSS Color 4).
+pub let tf_prophoto_rgb: TransferFunction = TransferFunction(g = 1.8, a = 1.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+pub let tf_a98_rgb: TransferFunction = tf_2dot2
+
+## The transfer function of ITU-T H.273 transfer characteristics code `id`
+## (SkNamedTransferFn::GetCicp).
+pub func cicp_transfer_function(id: u8) -> TransferFunction?:
+    match id:
+        1: return tf_rec709
+        4: return tf_rec470_system_m
+        5: return tf_rec470_system_bg
+        6: return tf_rec601
+        7: return tf_smpte_st_240
+        8: return tf_linear
+        11: return tf_iec61966_2_4
+        13: return tf_iec61966_2_1
+        14: return tf_rec2020_10bit
+        15: return tf_rec2020_12bit
+        16: return tf_pq
+        17: return tf_smpte_st_428_1
+        18: return tf_hlg
+        _: return none
+
+# mark: Named gamuts ===========================================================================
+
+## SkFixedToFloat: a 16.16 fixed-point value.
+func fixed_to_float(x: i32) -> f32:
+    return (f32)x * 1.52587890625e-5
+
+## SkNamedGamut::kSRGB, the ICC fixed-point values skcms uses.
+pub func gamut_srgb() -> Matrix3x3:
+    return Matrix3x3(vals = [[fixed_to_float(0x6FA2), fixed_to_float(0x6299), fixed_to_float(0x24A0)], [fixed_to_float(0x38F5), fixed_to_float(0xB785), fixed_to_float(0x0F84)], [fixed_to_float(0x0390), fixed_to_float(0x18DA), fixed_to_float(0xB6CF)]])
+
+## SkNamedGamut::kAdobeRGB.
+pub func gamut_adobe_rgb() -> Matrix3x3:
+    return Matrix3x3(vals = [[fixed_to_float(0x9c18), fixed_to_float(0x348d), fixed_to_float(0x2631)], [fixed_to_float(0x4fa5), fixed_to_float(0xa02c), fixed_to_float(0x102f)], [fixed_to_float(0x04fc), fixed_to_float(0x0f95), fixed_to_float(0xbe9c)]])
+
+## SkNamedGamut::kDisplayP3.
+pub let gamut_display_p3: Matrix3x3 = Matrix3x3(vals = [[0.515102, 0.291965, 0.157153], [0.241182, 0.692236, 0.0665819], [-0.00104941, 0.0418818, 0.784378]])
+## SkNamedGamut::kRec2020.
+pub let gamut_rec2020: Matrix3x3 = Matrix3x3(vals = [[0.673459, 0.165661, 0.125100], [0.279033, 0.675338, 0.0456288], [-0.00193139, 0.0299794, 0.797162]])
+## SkNamedGamut::kXYZ.
+pub let gamut_xyz: Matrix3x3 = Matrix3x3(vals = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+
+# mark: Near enough ============================================================================
+
+## color_space_almost_equal.
+func color_space_almost_equal(x: f32, y: f32) -> bool:
+    return math32.abs(x - y) < 0.01
+
+## transfer_fn_almost_equal: stricter; ICC curves have 16 bits of fraction.
+func transfer_fn_almost_equal(x: f32, y: f32) -> bool:
+    return math32.abs(x - y) < 0.001
+
+## is_almost_srgb.
+func is_almost_srgb(coeffs: const TransferFunction*) -> bool:
+    return transfer_fn_almost_equal(tf_srgb.a, coeffs.a) and transfer_fn_almost_equal(tf_srgb.b, coeffs.b) and transfer_fn_almost_equal(tf_srgb.c, coeffs.c) and transfer_fn_almost_equal(tf_srgb.d, coeffs.d) and transfer_fn_almost_equal(tf_srgb.e, coeffs.e) and transfer_fn_almost_equal(tf_srgb.f, coeffs.f) and transfer_fn_almost_equal(tf_srgb.g, coeffs.g)
+
+## is_almost_2dot2.
+func is_almost_2dot2(coeffs: const TransferFunction*) -> bool:
+    return transfer_fn_almost_equal(1.0, coeffs.a) and transfer_fn_almost_equal(0.0, coeffs.b) and transfer_fn_almost_equal(0.0, coeffs.e) and transfer_fn_almost_equal(2.2, coeffs.g) and coeffs.d <= 0.0
+
+## is_almost_linear: x^1, or the linear piece 1 * x over all of 0..1.
+func is_almost_linear(coeffs: const TransferFunction*) -> bool:
+    let linear_exp = transfer_fn_almost_equal(1.0, coeffs.a) and transfer_fn_almost_equal(0.0, coeffs.b) and transfer_fn_almost_equal(0.0, coeffs.e) and transfer_fn_almost_equal(1.0, coeffs.g) and coeffs.d <= 0.0
+    let linear_fn = transfer_fn_almost_equal(1.0, coeffs.c) and transfer_fn_almost_equal(0.0, coeffs.f) and coeffs.d >= 1.0
+    return linear_exp or linear_fn
+
+## xyz_almost_equal.
+func xyz_almost_equal(ma: const Matrix3x3*, mb: const Matrix3x3*) -> bool:
+    for r in 0..<(usize)3:
+        for c in 0..<(usize)3:
+            if not color_space_almost_equal(ma.vals[r][c], mb.vals[r][c]):
+                return false
+    return true
+
+# mark: Making color spaces ====================================================================
+
+extend ColorSpace:
+    ## sRGB (SkColorSpace::MakeSRGB).
+    pub static func srgb() -> ColorSpace:
+        return ColorSpace(transfer_function = tf_srgb, to_xyzd50 = gamut_srgb())
+
+    ## Linear sRGB (SkColorSpace::MakeSRGBLinear).
+    pub static func srgb_linear() -> ColorSpace:
+        return ColorSpace(transfer_function = tf_linear, to_xyzd50 = gamut_srgb())
+
+    ## A color space of a transfer function and a matrix to XYZ D50 (SkColorSpace::MakeRGB):
+    ## none for an invalid transfer function; one nearly sRGB's, 2.2 or linear becomes that.
+    pub static func rgb(curve: const TransferFunction*, to_xyz: const Matrix3x3*) -> ColorSpace?:
+        if curve.kind() == .invalid:
+            return none
+        var tf = *curve
+        let srgb_gamut = gamut_srgb()
+        if is_almost_srgb(curve):
+            if xyz_almost_equal(to_xyz, &srgb_gamut):
+                return ColorSpace.srgb()
+            tf = tf_srgb
+        elif is_almost_2dot2(curve):
+            tf = tf_2dot2
+        elif is_almost_linear(curve):
+            if xyz_almost_equal(to_xyz, &srgb_gamut):
+                return ColorSpace.srgb_linear()
+            tf = tf_linear
+        return ColorSpace(transfer_function = tf, to_xyzd50 = *to_xyz)
+
+    ## The color space of ITU-T H.273 code points (SkColorSpace::MakeCICP).
+    pub static func cicp(color_primaries: u8, transfer_characteristics: u8) -> ColorSpace?:
+        let tf = cicp_transfer_function(transfer_characteristics) else return none
+        let primaries = cicp_primaries(color_primaries) else return none
+        let matrix = primaries.to_xyzd50() else return none
+        return ColorSpace.rgb(&tf, &matrix)
+
+    ## The color space of a profile (SkColorSpace::Make): its cicp tag when full-range with
+    ## no matrix, else its matrix and parametric curves; tabulated or mismatched curves only
+    ## when all three are close enough to sRGB's. None when the profile has neither.
+    pub static func from_profile(profile: const Profile*) -> ColorSpace?:
+        # The CICP values are only valid for full-range, with no matrix.
+        let use_cicp = profile.has_cicp and profile.cicp.matrix_coefficients == 0 and profile.cicp.video_full_range_flag == 1
+        let cicp_color_primaries = profile.cicp.color_primaries
+        let cicp_transfer_characteristics = profile.cicp.transfer_characteristics
+
+        # Early checks for exact sRGB matches (Skia compares the transfer characteristics
+        # with kIEC61966_2_4, value 11, here).
+        let srgb_profile = Profile.srgb()
+        if use_cicp and cicp_color_primaries == 1 and cicp_transfer_characteristics == 11:
+            return ColorSpace.srgb()
+        elif approximately_equal_profiles(profile, &srgb_profile):
+            return ColorSpace.srgb()
+
+        # Set the toXYZD50 matrix, preferring CICP over the matrix itself.
+        var to_xyzd50 = zero_matrix()
+        var has_set_to_xyzd50 = false
+        if use_cicp:
+            if let primaries = cicp_primaries(cicp_color_primaries):
+                if let matrix = primaries.to_xyzd50():
+                    to_xyzd50 = matrix
+                    has_set_to_xyzd50 = true
+            elif cicp_color_primaries != cicp_application_defined:
+                return none
+        if profile.has_to_xyzd50 and not has_set_to_xyzd50:
+            to_xyzd50 = profile.to_xyzd50
+            if to_xyzd50.invert() != none:
+                has_set_to_xyzd50 = true
+        if not has_set_to_xyzd50:
+            return none
+
+        # Set the transfer function, preferring CICP over the curves.
+        var trfn = tf_linear
+        var has_set_trfn = false
+        if use_cicp:
+            if let tf = cicp_transfer_function(cicp_transfer_characteristics):
+                trfn = tf
+                has_set_trfn = true
+            elif cicp_transfer_characteristics != cicp_application_defined:
+                return none
+        if profile.has_trc and not has_set_trfn:
+            # We can't work with tables or mismatched parametric curves.
+            let trc = profile.trc
+            if trc[0].table_entries == 0 and trc[1].table_entries == 0 and trc[2].table_entries == 0 and same_transfer_function(&trc[0].parametric, &trc[1].parametric) and same_transfer_function(&trc[0].parametric, &trc[2].parametric):
+                trfn = profile.trc[0].parametric
+                has_set_trfn = true
+            elif profile.trcs_are_approximate_inverse(&srgb_inverse_transfer_function):
+                # If all curves look close enough to sRGB, that's fine.
+                trfn = tf_srgb
+                has_set_trfn = true
+        if not has_set_trfn:
+            return none
+        return ColorSpace.rgb(&trfn, &to_xyzd50)
+
+    ## Whether this is sRGB (SkColorSpace::isSRGB, comparing values where Skia compares the
+    ## singleton's address).
+    pub func is_srgb() -> bool:
+        let srgb = ColorSpace.srgb()
+        return self.same(&srgb)
+
+    ## Whether two color spaces hold the same bits (Skia's hash comparison).
+    pub func same(other: const ColorSpace*) -> bool:
+        return same_transfer_function(&self.transfer_function, &other.transfer_function) and same_matrix(&self.to_xyzd50, &other.to_xyzd50)
+
+    ## The inverse of the transfer function, sRGB's when it has none (computeLazyDstFields).
+    pub func inverse_transfer_function() -> TransferFunction:
+        return self.transfer_function.invert() else srgb_inverse_transfer_function
+
+    ## The matrix from XYZ D50, sRGB's when this one does not invert (computeLazyDstFields).
+    pub func from_xyzd50() -> Matrix3x3:
+        if let inverse = self.to_xyzd50.invert():
+            return inverse
+        return srgb_to_xyzd50.invert() else trap("sRGB's matrix inverts")
+
+    ## The matrix from this space's linear values to `dst`'s (gamutTransformTo).
+    pub func gamut_transform_to(dst: const ColorSpace*) -> Matrix3x3:
+        let dst_from_xyzd50 = dst.from_xyzd50()
+        return dst_from_xyzd50.concat(&self.to_xyzd50)
+
+    ## This space as a profile (toProfile): its curve and matrix, and a cicp tag for PQ and
+    ## HLG curves.
+    pub func to_profile() -> Profile:
+        var profile = Profile.empty()
+        profile.set_transfer_function(&self.transfer_function)
+        profile.set_xyzd50(&self.to_xyzd50)
+        let kind = self.transfer_function.kind()
+        if kind == .pq or kind == .pqish:
+            profile.has_cicp = true
+            profile.cicp.transfer_characteristics = 16
+        elif kind == .hlg or kind == .hlgish:
+            profile.has_cicp = true
+            profile.cicp.transfer_characteristics = 18
+        if profile.has_cicp:
+            profile.cicp.matrix_coefficients = 0
+            profile.cicp.video_full_range_flag = 1
+            profile.cicp.color_primaries = cicp_primaries_from_matrix(&self.to_xyzd50) else cicp_application_defined
+        return profile

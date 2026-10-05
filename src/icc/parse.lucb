@@ -1,0 +1,349 @@
+#==============================================================================================
+#
+#   icc/parse - reading a profile: the header, the tag table, curves, XYZ and cicp tags
+#
+#   DESCRIPTION:
+#       Port of skcms.cc's profile reader: the big-endian readers, the header layout
+#       (ICC.1:2010 section 7.2), read_curve_para and read_curve_curv (para and curv tags),
+#       read_tag_xyz and read_to_XYZD50, read_cicp, skcms_GetTagByIndex and
+#       skcms_GetTagBySignature, skcms_GetCHAD, skcms_GetWTPT, skcms_GetInputChannelCount and
+#       skcms_ParseWithA2BPriority. The lookup tables are parse_lut.lucb.
+#
+#       Offsets are checked as skcms checks them, in 64-bit arithmetic, so a profile whose
+#       sizes or offsets lie is refused rather than read out of bounds.
+#
+#==============================================================================================
+
+# mark: Big-endian readers =====================================================================
+
+func read_big_u16(data: const u8[], at: u64) -> u32:
+    let i = (usize)at
+    return ((u32)data[i] << 8) | (u32)data[i + 1]
+
+func read_big_u32(data: const u8[], at: u64) -> u32:
+    let i = (usize)at
+    return ((u32)data[i] << 24) | ((u32)data[i + 1] << 16) | ((u32)data[i + 2] << 8) | (u32)data[i + 3]
+
+## A signed 15.16 fixed-point number as a float.
+func read_big_fixed(data: const u8[], at: u64) -> f32:
+    return (f32)(i32)read_big_u32(data, at) * (1.0 / 65536.0)
+
+# The header (132 bytes with the tag count), and a tag table entry (12 bytes).
+let header_size: u64 = 132
+let tag_entry_size: u64 = 12
+
+# Offsets in the header.
+let header_size_field: u64 = 0
+let header_version: u64 = 8
+let header_data_color_space: u64 = 16
+let header_pcs: u64 = 20
+let header_signature: u64 = 36
+let header_illuminant: u64 = 68
+let header_tag_count: u64 = 128
+
+# mark: Tags ===================================================================================
+
+## The tag described by tag table entry `index`.
+func tag_at(profile: const Profile*, index: u32) -> Tag:
+    let entry = header_size + (u64)index * tag_entry_size
+    let signature = read_big_u32(profile.buffer, entry)
+    let offset = (u64)read_big_u32(profile.buffer, entry + 4)
+    let size = read_big_u32(profile.buffer, entry + 8)
+    let data = profile.buffer[(usize)offset..<(usize)(offset + (u64)size)]
+    return Tag(signature = signature, kind = read_big_u32(data, 0), size = size, data = data)
+
+extend Profile:
+    ## Tag `index` of the tag table (skcms_GetTagByIndex), or none past the table's end.
+    pub func tag_by_index(index: u32) -> Tag?:
+        if self.buffer.length == 0 or index >= self.tag_count:
+            return none
+        return tag_at(&self, index)
+
+    ## The first tag with `signature` (skcms_GetTagBySignature).
+    pub func tag_by_signature(signature: u32) -> Tag?:
+        if self.buffer.length == 0:
+            return none
+        for i in 0..<self.tag_count:
+            if read_big_u32(self.buffer, header_size + (u64)i * tag_entry_size) == signature:
+                return tag_at(&self, i)
+        return none
+
+    ## The chromatic adaptation tag, `chad` (skcms_GetCHAD).
+    pub func chad() -> Matrix3x3?:
+        let tag = self.tag_by_signature(signature_chad) else return none
+        # An s15Fixed16ArrayType of exactly nine values: type, reserved, values.
+        if tag.kind != signature_sf32 or tag.size < 44:
+            return none
+        var m = zero_matrix()
+        var at: u64 = 8
+        for r in 0..<(usize)3:
+            for c in 0..<(usize)3:
+                m.vals[r][c] = read_big_fixed(tag.data, at)
+                at += 4
+        return m
+
+    ## The media white point tag, `wtpt` (skcms_GetWTPT), as XYZ.
+    pub func white_point() -> f32[3]?:
+        let tag = self.tag_by_signature(signature_wtpt) else return none
+        return read_tag_xyz(&tag)
+
+    ## The channels of the profile's device data (skcms_GetInputChannelCount): 1 for gray,
+    ## 3 for RGB, 4 for CMYK and so on, or -1 when its tags and data color space disagree.
+    pub func input_channel_count() -> i32:
+        var a2b_count: i32 = 0
+        if self.has_a2b:
+            a2b_count = (i32)self.a2b.input_channels if self.a2b.input_channels != 0 else 3
+
+        var trc_count: i32 = 0
+        if self.tag_by_signature(signature_ktrc) != none:
+            trc_count = 1
+        elif self.has_trc:
+            trc_count = 3
+
+        let dcs_count = data_color_space_channel_count(self.data_color_space)
+        if dcs_count < 0:
+            return -1
+        if a2b_count > 0 and a2b_count != dcs_count:
+            return -1
+        if trc_count > 0 and trc_count != dcs_count:
+            return -1
+        return dcs_count
+
+## data_color_space_channel_count.
+func data_color_space_channel_count(data_color_space: u32) -> i32:
+    if data_color_space == signature_cmyk:
+        return 4
+    if data_color_space == signature_gray:
+        return 1
+    if data_color_space == signature_rgb or data_color_space == signature_lab or data_color_space == signature_xyz or data_color_space == signature_cieluv or data_color_space == signature_ycbcr or data_color_space == signature_cieyxy or data_color_space == signature_hsv or data_color_space == signature_hls or data_color_space == signature_cmy:
+        return 3
+    # nCLR: '2CLR' to '9CLR', then 'ACLR' (10) to 'FCLR' (15).
+    if data_color_space >= signature_2clr and data_color_space <= signature_15clr and (data_color_space & 0x00FFFFFF) == 0x00434C52:
+        let digit = data_color_space >> 24
+        if digit >= 0x32 and digit <= 0x39:
+            return (i32)(digit - 0x30)
+        if digit >= 0x41 and digit <= 0x46:
+            return (i32)(digit - 0x41 + 10)
+    return -1
+
+## read_tag_xyz: an XYZType tag holding one triple.
+func read_tag_xyz(tag: const Tag*) -> f32[3]?:
+    if tag.kind != signature_xyz or tag.size < 20:
+        return none
+    return [read_big_fixed(tag.data, 8), read_big_fixed(tag.data, 12), read_big_fixed(tag.data, 16)]
+
+## read_to_XYZD50: the colorant tags as the columns of the matrix.
+func read_to_xyzd50(r_xyz: const Tag*, g_xyz: const Tag*, b_xyz: const Tag*) -> Matrix3x3?:
+    let r = read_tag_xyz(r_xyz) else return none
+    let g = read_tag_xyz(g_xyz) else return none
+    let b = read_tag_xyz(b_xyz) else return none
+    return Matrix3x3(vals = [[r[0], g[0], b[0]], [r[1], g[1], b[1]], [r[2], g[2], b[2]]])
+
+## read_cicp.
+func read_cicp(tag: const Tag*) -> Cicp?:
+    if tag.kind != signature_cicp or tag.size < 12:
+        return none
+    return Cicp(color_primaries = tag.data[8], transfer_characteristics = tag.data[9], matrix_coefficients = tag.data[10], video_full_range_flag = tag.data[11])
+
+# mark: Curves =================================================================================
+
+## The curve a para or curv tag starts with, and the bytes it uses.
+struct ReadCurve:
+    var curve: Curve
+    var size: u32
+
+## read_curve_para: a parametricCurveType of function type 0 to 4 (g; g a b; g a b c;
+## g a b c d; g a b c d e f).
+func read_curve_para(data: const u8[], size: u64) -> ReadCurve?:
+    # type, reserved, function type, reserved: 12 bytes before the parameters.
+    if size < 12:
+        return none
+    let function_type = read_big_u16(data, 8)
+    if function_type > 4:
+        return none
+    let curve_bytes: u32[5] = [4, 12, 16, 20, 28]
+    if size < 12 + (u64)curve_bytes[(usize)function_type]:
+        return none
+
+    var curve = Curve()
+    var tf = TransferFunction(g = read_big_fixed(data, 12), a = 1.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+    match function_type:
+        1:
+            tf.a = read_big_fixed(data, 16)
+            tf.b = read_big_fixed(data, 20)
+            if tf.a == 0.0:
+                return none
+            tf.d = -tf.b / tf.a
+        2:
+            tf.a = read_big_fixed(data, 16)
+            tf.b = read_big_fixed(data, 20)
+            tf.e = read_big_fixed(data, 24)
+            if tf.a == 0.0:
+                return none
+            tf.d = -tf.b / tf.a
+            tf.f = tf.e
+        3:
+            tf.a = read_big_fixed(data, 16)
+            tf.b = read_big_fixed(data, 20)
+            tf.c = read_big_fixed(data, 24)
+            tf.d = read_big_fixed(data, 28)
+        4:
+            tf.a = read_big_fixed(data, 16)
+            tf.b = read_big_fixed(data, 20)
+            tf.c = read_big_fixed(data, 24)
+            tf.d = read_big_fixed(data, 28)
+            tf.e = read_big_fixed(data, 32)
+            tf.f = read_big_fixed(data, 36)
+        _:
+            _ = 0
+    curve.parametric = tf
+    if not tf.is_srgbish():
+        return none
+    return ReadCurve(curve = curve, size = 12 + curve_bytes[(usize)function_type])
+
+## read_curve_curv: a curveType, a table of 16-bit entries; none or one entry is a
+## shorthand for the identity or a pure gamma (8.8 fixed point).
+func read_curve_curv(data: const u8[], size: u64) -> ReadCurve?:
+    # type, reserved, value count: 12 bytes before the entries.
+    if size < 12:
+        return none
+    let value_count = read_big_u32(data, 8)
+    if size < 12 + (u64)value_count * 2:
+        return none
+
+    var curve = Curve()
+    if value_count < 2:
+        var tf = TransferFunction(g = 1.0, a = 1.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+        if value_count == 1:
+            # Single entry tables are a shorthand for simple gamma.
+            tf.g = (f32)read_big_u16(data, 12) * (1.0 / 256.0)
+        curve.parametric = tf
+    else:
+        curve.table_16 = data[12..<12 + (usize)value_count * 2]
+        curve.table_entries = value_count
+    return ReadCurve(curve = curve, size = (u32)(12 + (u64)value_count * 2))
+
+## read_curve: a para or curv curve in the first `size` bytes of `data`.
+func read_curve(data: const u8[], size: u64) -> ReadCurve?:
+    if size < 4:
+        return none
+    let kind = read_big_u32(data, 0)
+    if kind == signature_para:
+        return read_curve_para(data, size)
+    elif kind == signature_curv:
+        return read_curve_curv(data, size)
+    return none
+
+# mark: Parsing ================================================================================
+
+## The profile in `data` (skcms_Parse), reading A2B0 and B2A0 before A2B1 and B2A1; none
+## when it is malformed or holds neither an A2B lookup nor a matrix with its tone curves.
+pub func parse(data: const u8[]) -> Profile?:
+    let priority: i32[2] = [0, 1]
+    return parse_with_a2b_priority(data, priority)
+
+## The profile in `data`, choosing among the A2B and B2A rendering intents (0 perceptual,
+## 1 relative colorimetric, 2 saturation) in the order of `priority`
+## (skcms_ParseWithA2BPriority).
+pub func parse_with_a2b_priority(data: const u8[], priority: const i32[]) -> Profile?:
+    var profile = Profile()
+    if (u64)data.length < header_size:
+        return none
+
+    profile.buffer = data
+    profile.size = read_big_u32(data, header_size_field)
+    let version = read_big_u32(data, header_version)
+    profile.data_color_space = read_big_u32(data, header_data_color_space)
+    profile.pcs = read_big_u32(data, header_pcs)
+    let signature = read_big_u32(data, header_signature)
+    let illuminant_x = read_big_fixed(data, header_illuminant)
+    let illuminant_y = read_big_fixed(data, header_illuminant + 4)
+    let illuminant_z = read_big_fixed(data, header_illuminant + 8)
+    profile.tag_count = read_big_u32(data, header_tag_count)
+
+    # Validate signature, size (smaller than buffer, large enough to hold tag table), and
+    # major version.
+    let tag_table_size = (u64)profile.tag_count * tag_entry_size
+    if signature != signature_acsp or (u64)profile.size > (u64)data.length or (u64)profile.size < header_size + tag_table_size or (version >> 24) > 4:
+        return none
+    # The profile's own bytes: tags are read within its declared size.
+    profile.buffer = data[..<(usize)profile.size]
+
+    # Validate that illuminant is D50 white.
+    if fabsf_(illuminant_x - 0.9642) > 0.0100 or fabsf_(illuminant_y - 1.0000) > 0.0100 or fabsf_(illuminant_z - 0.8249) > 0.0100:
+        return none
+
+    # Validate that all tag entries have sane offset + size.
+    for i in 0..<profile.tag_count:
+        let entry = header_size + (u64)i * tag_entry_size
+        let tag_offset = (u64)read_big_u32(data, entry + 4)
+        let tag_size = (u64)read_big_u32(data, entry + 8)
+        if tag_size < 4 or tag_offset + tag_size > (u64)profile.size:
+            return none
+
+    if profile.pcs != signature_xyz and profile.pcs != signature_lab:
+        return none
+
+    let pcs_is_xyz = profile.pcs == signature_xyz
+
+    # Pre-parse commonly used tags.
+    var gray = false
+    if profile.data_color_space == signature_gray:
+        if let k_trc = profile.tag_by_signature(signature_ktrc):
+            gray = true
+            let read = read_curve(k_trc.data, (u64)k_trc.size) else return none
+            profile.trc[0] = read.curve
+            profile.trc[1] = read.curve
+            profile.trc[2] = read.curve
+            profile.has_trc = true
+            if pcs_is_xyz:
+                profile.to_xyzd50.vals[0][0] = illuminant_x
+                profile.to_xyzd50.vals[1][1] = illuminant_y
+                profile.to_xyzd50.vals[2][2] = illuminant_z
+                profile.has_to_xyzd50 = true
+    if not gray:
+        if let r_trc = profile.tag_by_signature(signature_rtrc):
+            if let g_trc = profile.tag_by_signature(signature_gtrc):
+                if let b_trc = profile.tag_by_signature(signature_btrc):
+                    let r = read_curve(r_trc.data, (u64)r_trc.size) else return none
+                    let g = read_curve(g_trc.data, (u64)g_trc.size) else return none
+                    let b = read_curve(b_trc.data, (u64)b_trc.size) else return none
+                    profile.trc[0] = r.curve
+                    profile.trc[1] = g.curve
+                    profile.trc[2] = b.curve
+                    profile.has_trc = true
+
+        if let r_xyz = profile.tag_by_signature(signature_rxyz):
+            if let g_xyz = profile.tag_by_signature(signature_gxyz):
+                if let b_xyz = profile.tag_by_signature(signature_bxyz):
+                    profile.to_xyzd50 = read_to_xyzd50(&r_xyz, &g_xyz, &b_xyz) else return none
+                    profile.has_to_xyzd50 = true
+
+    for intent in priority:
+        # enum { perceptual, relative_colormetric, saturation }
+        if intent < 0 or intent > 2:
+            return none
+        if let tag = profile.tag_by_signature(signature_a2b0 + (u32)intent):
+            profile.a2b = read_a2b(&tag, pcs_is_xyz) else return none
+            profile.has_a2b = true
+            break
+
+    for intent in priority:
+        if intent < 0 or intent > 2:
+            return none
+        if let tag = profile.tag_by_signature(signature_b2a0 + (u32)intent):
+            profile.b2a = read_b2a(&tag, pcs_is_xyz) else return none
+            profile.has_b2a = true
+            break
+
+    if let cicp_tag = profile.tag_by_signature(signature_cicp):
+        profile.cicp = read_cicp(&cicp_tag) else return none
+        profile.has_cicp = true
+
+    if not usable_as_src(&profile):
+        return none
+    return profile
+
+## usable_as_src: a lookup table, or tone curves with a matrix.
+func usable_as_src(profile: const Profile*) -> bool:
+    return profile.has_a2b or (profile.has_trc and profile.has_to_xyzd50)

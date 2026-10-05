@@ -1,0 +1,65 @@
+#==============================================================================================
+#
+#   tests/icc/transform - skcms_Transform between profiles and formats
+#
+#==============================================================================================
+
+## Display P3 as a profile: sRGB's curve and P3's primaries.
+func display_p3_profile() -> Profile:
+    var p3 = Profile.empty()
+    p3.set_transfer_function(&srgb_transfer_function)
+    let m = primaries_smpte_eg_432_1.to_xyzd50() else trap("P3 has a matrix")
+    p3.set_xyzd50(&m)
+    return p3
+
+test "pixels convert between profiles to skcms's bytes":
+    let srgb = Profile.srgb()
+    let p3 = display_p3_profile()
+    let src: u8[16] = [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 128, 119, 119, 119, 255]
+    var dst: u8[16]
+    assert(transform(src, .rgba_8888, .unpremul, &srgb, dst, .rgba_8888, .unpremul, &p3, 4))
+    let to_p3: u8[16] = [234, 51, 35, 255, 117, 251, 76, 255, 0, 0, 245, 128, 119, 119, 119, 255]
+    assert(dst == to_p3)
+    assert(transform(src, .rgba_8888, .unpremul, &p3, dst, .rgba_8888, .premul_as_encoded, &srgb, 4))
+    let to_srgb: u8[16] = [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 128, 128, 119, 119, 119, 255]
+    assert(dst == to_srgb)
+
+test "formats convert without a profile, and bad requests are refused":
+    let src: u8[8] = [10, 20, 30, 40, 50, 60, 70, 80]
+    var dst: u8[8]
+    # Both profiles left out: only the format changes (BGRA swaps red and blue).
+    assert(transform(src, .rgba_8888, .unpremul, none, dst, .bgra_8888, .unpremul, none, 2))
+    let swapped: u8[8] = [30, 20, 10, 40, 70, 60, 50, 80]
+    assert(dst == swapped)
+    # In place with the same pixel size.
+    var both: u8[8] = [10, 20, 30, 40, 50, 60, 70, 80]
+    assert(transform(both, .rgba_8888, .unpremul, none, both, .bgra_8888, .unpremul, none, 2))
+    assert(both == swapped)
+    var small: u8[4]
+    assert(not transform(src, .rgba_8888, .unpremul, none, small, .rgba_8888, .unpremul, none, 2))
+    assert(not transform(both, .rgba_8888, .unpremul, none, both, .rgb_888, .unpremul, none, 2))
+    # A destination with tables is not usable until it is made so.
+    let gray = test_profile("gray-ktrc.icc")
+    var out: u8[8]
+    assert(not transform(src, .rgba_8888, .unpremul, none, out, .rgba_8888, .unpremul, &gray, 2))
+    var usable = gray
+    assert(usable.make_usable_as_destination() and usable.trc[0].table_entries == 0)
+    assert(transform(src, .rgba_8888, .unpremul, none, out, .rgba_8888, .unpremul, &usable, 2))
+    assert(bytes_per_pixel(.rgba_ffff) == 16 and bytes_per_pixel(.rgb_101010x_xr) == 4 and bytes_per_pixel(.bgr_161616be) == 6)
+
+test "profiles compare by what they do to colors":
+    let srgb = Profile.srgb()
+    assert(approximately_equal_profiles(&srgb, &srgb))
+    let p3 = test_profile("p3-v4.icc")
+    let p3_again = test_profile("p3-v4.icc")
+    assert(approximately_equal_profiles(&p3, &p3_again))
+    let v4 = test_profile("ladybird-icc-v4.icc")
+    assert(approximately_equal_profiles(&v4, &srgb))
+    let swap = test_profile("wpt-swap-990000.icc")
+    assert(not approximately_equal_profiles(&swap, &srgb))
+    let cmyk = test_profile("mft1-cmyk.icc")
+    assert(not approximately_equal_profiles(&cmyk, &srgb))
+    assert(swap.trcs_are_approximate_inverse(&srgb_inverse_transfer_function))
+    var single = swap
+    assert(single.make_usable_as_destination_with_single_curve())
+    assert(same_transfer_function(&single.trc[0].parametric, &single.trc[2].parametric))

@@ -1,0 +1,66 @@
+#==============================================================================================
+#
+#   tests/icc/transfer_function - kinds, values and inverses of transfer functions
+#
+#==============================================================================================
+
+test "transfer functions are classified as skcms classifies them":
+    assert(srgb_transfer_function.kind() == .srgbish and srgb_inverse_transfer_function.kind() == .srgbish)
+    assert(TransferFunction.pq(203.0).kind() == .pq and TransferFunction.hlg(203.0, 1000.0, 1.2).kind() == .hlg)
+    let pqish = TransferFunction.pqish(-107.0 / 128.0, 1.0, 32.0 / 2523.0, 2413.0 / 128.0, -2392.0 / 128.0, 8192.0 / 1305.0)
+    assert(pqish.is_pqish() and TransferFunction.hlgish(2.0, 2.0, 5.6, 0.28, 0.55).is_hlgish())
+    # Negative a, c, d or g, a non-whole marker, an unknown marker and a stray PQ field fail.
+    assert(TransferFunction(g = 2.2, a = -1.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0).kind() == .invalid)
+    assert(TransferFunction(g = -2.5, a = 1.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0).kind() == .invalid)
+    assert(TransferFunction(g = -7.0, a = 1.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0).kind() == .invalid)
+    assert(TransferFunction(g = -5.0, a = 203.0, b = 1.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0).kind() == .invalid)
+    assert(TransferFunction(g = 2.2, a = 1.0, b = -1.0, c = 0.0, d = 0.5, e = 0.0, f = 0.0).kind() == .invalid)
+
+test "transfer functions evaluate to skcms's bits":
+    assert(has_bits(srgb_transfer_function.eval(0.5), 0x3e5b2100))
+    # Negative inputs mirror.
+    assert(has_bits(srgb_transfer_function.eval(-0.25), 0xbd5056c0))
+    assert(has_bits(srgb_inverse_transfer_function.eval(0.2), 0x3ef81600))
+    assert(has_bits(TransferFunction.pq(203.0).eval(0.5), 0x3c172b80))
+    assert(has_bits(TransferFunction.hlg(203.0, 1000.0, 1.2).eval(0.75), 0x3e87a958))
+    let pqish = TransferFunction.pqish(-107.0 / 128.0, 1.0, 32.0 / 2523.0, 2413.0 / 128.0, -2392.0 / 128.0, 8192.0 / 1305.0)
+    assert(has_bits(pqish.eval(0.5), 0x3c172b80))
+    let hlgish = TransferFunction.hlgish(2.0, 2.0, 1.0 / 0.17883277, 0.28466892, 0.55991073)
+    assert(has_bits(hlgish.eval(0.8), 0x4083a042))
+    let invalid = TransferFunction(g = -9.0, a = 1.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+    assert(invalid.eval(0.5) == 0.0)
+
+test "inverses are skcms's and keep f(1) at 1":
+    let inv = srgb_transfer_function.invert() else trap("sRGB inverts")
+    assert(tf_has_bits(&inv, [0x3ed55555, 0x3f919280, 0x80000000, 0x414eb852, 0x3b4d2e31, 0xbd612800, 0x80000000]))
+    assert(same_transfer_function(&inv, &srgb_inverse_transfer_function))
+    assert(inv.eval(srgb_transfer_function.eval(1.0)) == 1.0)
+    let pqish = TransferFunction.pqish(-107.0 / 128.0, 1.0, 32.0 / 2523.0, 2413.0 / 128.0, -2392.0 / 128.0, 8192.0 / 1305.0)
+    let pq_inv = pqish.invert() else trap("PQ-ish inverts")
+    assert(tf_has_bits(&pq_inv, [0xc0000000, 0x3f560000, 0x4196d000, 0x3e232000, 0x3f800000, 0x41958000, 0x429db000]))
+    assert(has_bits(pq_inv.eval(0.25), 0x3f59f040))
+    let hlgish = TransferFunction.hlgish(2.0, 2.0, 1.0 / 0.17883277, 0.28466892, 0.55991073)
+    let hlg_inv = hlgish.invert() else trap("HLG-ish inverts")
+    assert(hlg_inv.kind() == .hlginvish)
+    assert(tf_has_bits(&hlg_inv, [0xc0800000, 0x3f000000, 0x3f000000, 0x3e371ff0, 0x3e91c020, 0x3f0f564f, 0x00000000]))
+    assert(has_bits(hlg_inv.eval(3.0), 0x3f3d1185))
+    let back = hlg_inv.invert() else trap("HLG-inv-ish inverts")
+    assert(back.kind() == .hlgish)
+    # PQ and HLG proper, and a discontinuous curve, do not invert.
+    assert(TransferFunction.pq(203.0).invert() == none and TransferFunction.hlg(203.0, 1000.0, 1.2).invert() == none)
+    let broken = TransferFunction(g = 2.4, a = 1.0, b = 0.0, c = 1.0, d = 0.5, e = 0.0, f = 0.1)
+    assert(broken.invert() == none)
+
+test "a tabulated curve evaluates and is approximated":
+    let p = test_profile("gray-ktrc.icc")
+    let curve = p.trc[0]
+    assert(curve.table_entries == 1024 and curve.table_16.length == 2048)
+    assert(curve.eval(0.0) == 0.0 and curve.eval(1.0) == 1.0 and curve.eval(2.0) == 1.0 and curve.eval(-1.0) == 0.0)
+    assert(near(curve.eval(0.5), srgb_transfer_function.eval(0.5), 0.0001))
+    let (tf, err) = curve.approximate() else trap("the table approximates")
+    assert(tf_has_bits(&tf, [0x40195095, 0x3f731500, 0x3d4aa055, 0x3d9f26b5, 0x3d382e0c, 0x39b60000, 0x00000000]))
+    assert(has_bits(err, 0x3b0130c0))
+    assert(curve.are_approximate_inverses(&srgb_inverse_transfer_function))
+    # A parametric curve has nothing to approximate.
+    let parametric = Curve(parametric = srgb_transfer_function)
+    assert(parametric.approximate() == none)

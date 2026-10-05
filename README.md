@@ -14,6 +14,7 @@ UI theme and a file codec agree about what a color is:
 | `oklab` | Oklab from XYZ, ΔEok, sRGB `max_chroma(l, h)`, CSS-style gamut mapping by chroma reduction (`to_srgb`), gamut-relative chroma for pickers |
 | `hsl` | HSV (Photoshop's HSB) and HSL over encoded RGB, for pickers |
 | `space` | `ColorSpace` = name + primaries + transfer, as OpenColorIO models one; a catalogue (`space.all`, `space.named`); `convert(color, from, to)` — decode, matrix, adapt, matrix, encode — plus `to_lab`, `to_oklab_in`, `to_appearance`, `in_gamut`, `clamp` |
+| `icc` | ICC profiles, a port of skcms (Skia's ICC library): `parse` (v2 and v4, matrix/TRC, A2B/B2A lookup tables, cicp), transfer functions and curve fitting, `transform` between profiles and pixel formats; Skia's `ColorSpace` (from a profile, CICP code points or named primaries and curves) and the `Steps` between two of them |
 
 ```luce
 from luce_color import space, lab, cam16
@@ -36,6 +37,46 @@ Numbers are checked against the published references in each module's tests:
 the sRGB matrix, ST 2084's luminance anchors, Sharma's CIEDE2000 pairs, CAM16's
 white and inverse. An OCIO config reader is not here yet; `space.convert` is the
 processor chain one would produce for a pair of its color spaces.
+
+## ICC profiles (`icc`)
+
+`icc` is a faithful port of skcms, the ICC library Skia (and so Chrome, Android and Ladybird)
+uses, with the parts of Skia that make a profile into the color space an image is drawn in.
+It computes in f32 in skcms's order without fused multiply-adds, so its results are skcms's
+built portable without contraction, to the bit: `tests/run.py` holds every profile of
+`tests/fixtures/icc` against skcms's own dump of it, and against Skia's color spaces.
+
+```luce
+from luce_color import icc
+
+# A PNG's iCCP profile: what does it make of a pixel, in sRGB?
+let profile = icc.parse(profile_bytes) else return
+let srgb = icc.Profile.srgb()
+_ = icc.transform(pixels, .rgba_8888, .unpremul, &profile, out, .rgba_8888, .unpremul, &srgb, count)
+
+# As Skia draws an image tagged with it: the color space, then the steps to sRGB.
+if let space = icc.ColorSpace.from_profile(&profile):
+    let destination = icc.ColorSpace.srgb()
+    let steps = icc.Steps.make(&space, .premul, &destination, .premul)
+    let shown = steps.apply([0.6, 0.0, 0.0, 1.0])
+
+# CICP code points (ITU-T H.273), as a PNG's cICP chunk gives them: Display P3.
+let p3 = icc.ColorSpace.cicp(12, 13)
+```
+
+| Function | Purpose |
+| --- | --- |
+| `parse(bytes)`, `parse_with_a2b_priority` | A profile, or none when malformed or unusable (skcms_Parse). |
+| `transform(src, format, alpha, profile, dst, ...)` | Pixels between profiles and formats (skcms_Transform). |
+| `TransferFunction.kind/eval/invert` | skcms's transfer functions: sRGB-ish, PQ(-ish), HLG(-ish). |
+| `Curve.eval/approximate` | A tone curve; a table fitted with a transfer function (skcms_ApproximateCurve). |
+| `Profile.make_usable_as_destination` | Tabulated curves replaced by fitted ones. |
+| `approximately_equal_profiles(a, b)` | Profiles that move colors alike (skcms_ApproximatelyEqualProfiles). |
+| `ColorSpace.from_profile/cicp/rgb` | Skia's SkColorSpace::Make, MakeCICP, MakeRGB. |
+| `Steps.make(src, alpha, dst, alpha)` | SkColorSpaceXformSteps; `apply` on one color. |
+| `transfer_function(t)`, `primaries_matrix(p)`, `ColorSpace.from_space(s)` | This library's `transfer`, `xyz` and `space` types in skcms's terms. |
+
+skcms and Skia are BSD-3-Clause (LICENSE-skia); the port keeps their notices.
 
 ## Theme derivations (`color`)
 

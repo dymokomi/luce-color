@@ -1,0 +1,214 @@
+#==============================================================================================
+#
+#   icc/transfer_function - what a transfer function is, its value, and its inverse
+#
+#   DESCRIPTION:
+#       Port of skcms.cc's classify, skcms_TransferFunction_getType and the is* tests, the
+#       make* constructors, skcms_TransferFunction_eval and skcms_TransferFunction_invert, and
+#       the canonical transfer functions (skcms_sRGB_TransferFunction, its inverse and the
+#       identity). Most transfer functions are sRGB-ish; the HDR ones are encoded with a
+#       negative `g` naming their kind (TFKind_marker) and the other fields holding their
+#       parameters: PQ-ish as A..F in a..f, HLG-ish as R, G, a, b, c, K - 1 in a..f.
+#
+#==============================================================================================
+
+# mark: Canonical transfer functions ===========================================================
+
+## skcms_sRGB_TransferFunction: sRGB's curve, with skcms's exact coefficients.
+pub let srgb_transfer_function: TransferFunction = TransferFunction(g = f32.bits(0x4019999a), a = f32.bits(0x3f72a76e), b = f32.bits(0x3d558919), c = f32.bits(0x3d9e8391), d = f32.bits(0x3d25aee6), e = 0.0, f = 0.0)
+
+## skcms_sRGB_Inverse_TransferFunction.
+pub let srgb_inverse_transfer_function: TransferFunction = TransferFunction(g = f32.bits(0x3ed55555), a = f32.bits(0x3f919280), b = f32.bits(0x80000000), c = f32.bits(0x414eb852), d = f32.bits(0x3b4d2e31), e = f32.bits(0xbd612800), f = f32.bits(0x80000000))
+
+## skcms_Identity_TransferFunction.
+pub let identity_transfer_function: TransferFunction = TransferFunction(g = 1.0, a = 1.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+
+# mark: Kinds ==================================================================================
+
+## TFKind_marker: the `g` that marks an HDR kind.
+func kind_marker(kind: TfType) -> f32:
+    match kind:
+        .pqish: return -2.0
+        .hlgish: return -3.0
+        .hlginvish: return -4.0
+        .pq: return -5.0
+        .hlg: return -6.0
+        _: return 0.0
+
+extend TransferFunction:
+    ## What this transfer function computes (skcms_TransferFunction_getType): `invalid` for
+    ## an sRGB-ish one with negative or non-finite parameters, or an unknown marker.
+    pub func kind() -> TfType:
+        if self.g < 0.0:
+            # Negative "g" is mapped to enum values; large negative are for sure invalid.
+            if self.g < -128.0:
+                return .invalid
+            let enum_g = -(i32)self.g
+            # Non-whole "g" values are invalid as well.
+            if (f32)(-enum_g) != self.g:
+                return .invalid
+            match enum_g:
+                2: return .pqish
+                3: return .hlgish
+                4: return .hlginvish
+                5:
+                    if self.b != 0.0 or self.c != 0.0 or self.d != 0.0 or self.e != 0.0 or self.f != 0.0:
+                        return .invalid
+                    return .pq
+                6:
+                    if self.d != 0.0 or self.e != 0.0 or self.f != 0.0:
+                        return .invalid
+                    return .hlg
+                _: return .invalid
+
+        # Basic soundness checks for sRGBish transfer functions: a, c, d, g should be
+        # non-negative to make any sense, and raising a negative value to a fractional g
+        # produces complex numbers.
+        if isfinitef_(self.a + self.b + self.c + self.d + self.e + self.f + self.g) and self.a >= 0.0 and self.c >= 0.0 and self.d >= 0.0 and self.g >= 0.0 and self.a * self.d + self.b >= 0.0:
+            return .srgbish
+        return .invalid
+
+    pub func is_srgbish() -> bool:
+        return self.kind() == .srgbish
+
+    pub func is_pqish() -> bool:
+        return self.kind() == .pqish
+
+    pub func is_hlgish() -> bool:
+        return self.kind() == .hlgish
+
+    pub func is_pq() -> bool:
+        return self.kind() == .pq
+
+    pub func is_hlg() -> bool:
+        return self.kind() == .hlg
+
+    ## skcms_TransferFunction_makePQish: ((A + B x^C) / (D + E x^C))^F.
+    pub static func pqish(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) -> TransferFunction:
+        return TransferFunction(g = kind_marker(.pqish), a = a, b = b, c = c, d = d, e = e, f = f)
+
+    ## skcms_TransferFunction_makeScaledHLGish: K times R, G, a, b, c's HLG-ish curve.
+    pub static func scaled_hlgish(k: f32, r: f32, g: f32, a: f32, b: f32, c: f32) -> TransferFunction:
+        return TransferFunction(g = kind_marker(.hlgish), a = r, b = g, c = a, d = b, e = c, f = k - 1.0)
+
+    ## skcms_TransferFunction_makeHLGish.
+    pub static func hlgish(r: f32, g: f32, a: f32, b: f32, c: f32) -> TransferFunction:
+        return TransferFunction.scaled_hlgish(1.0, r, g, a, b, c)
+
+    ## skcms_TransferFunction_makePQ: PQ with linear 1.0 at `hdr_reference_white_luminance`.
+    pub static func pq(hdr_reference_white_luminance: f32) -> TransferFunction:
+        return TransferFunction(g = kind_marker(.pq), a = hdr_reference_white_luminance, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+
+    ## skcms_TransferFunction_makeHLG.
+    pub static func hlg(hdr_reference_white_luminance: f32, peak_luminance: f32, system_gamma: f32) -> TransferFunction:
+        return TransferFunction(g = kind_marker(.hlg), a = hdr_reference_white_luminance, b = peak_luminance, c = system_gamma, d = 0.0, e = 0.0, f = 0.0)
+
+    ## The transfer function at `x` (skcms_TransferFunction_eval), mirrored for negative `x`;
+    ## 0 for an invalid one.
+    pub func eval(input: f32) -> f32:
+        let sign: f32 = -1.0 if input < 0.0 else 1.0
+        let x = input * sign
+        match self.kind():
+            .invalid:
+                return 0.0
+            .hlg:
+                let a: f32 = 0.17883277
+                let b: f32 = 0.28466892
+                let c: f32 = 0.55991073
+                return sign * (x * x / 3.0 if x <= 0.5 else (expf_((x - c) / a) + b) / 12.0)
+            .hlgish:
+                # R, G, a, b, c, K - 1 in a..f.
+                let k = self.f + 1.0
+                return k * sign * (powf_(x * self.a, self.b) if x * self.a <= 1.0 else expf_((x - self.e) * self.c) + self.d)
+            .hlginvish:
+                # skcms_TransferFunction_invert() inverts R, G, and a for HLGinvish so this
+                # math is fast.
+                let k = self.f + 1.0
+                let scaled = x / k
+                return sign * (self.a * powf_(scaled, self.b) if scaled <= 1.0 else self.c * logf_(scaled - self.d) + self.e)
+            .srgbish:
+                return sign * (self.c * x + self.f if x < self.d else powf_(self.a * x + self.b, self.g) + self.e)
+            .pq:
+                let c1: f32 = 107.0 / 128.0
+                let c2: f32 = 2413.0 / 128.0
+                let c3: f32 = 2392.0 / 128.0
+                let m1: f32 = 1305.0 / 8192.0
+                let m2: f32 = 2523.0 / 32.0
+                let p = powf_(x, 1.0 / m2)
+                return powf_((p - c1) / (c2 - c3 * p), 1.0 / m1)
+            .pqish:
+                return sign * powf_((self.a + self.b * powf_(x, self.c)) / (self.d + self.e * powf_(x, self.c)), self.f)
+
+    ## The inverse (skcms_TransferFunction_invert), or none when there is none: PQ and HLG
+    ## (as opposed to PQ-ish and HLG-ish) do not invert, nor does a discontinuous sRGB-ish
+    ## function. The inverse keeps inverse(f(1)) == 1.
+    pub func invert() -> TransferFunction?:
+        match self.kind():
+            .invalid, .pq, .hlg:
+                return none
+            .pqish:
+                return TransferFunction(g = kind_marker(.pqish), a = -self.a, b = self.d, c = 1.0 / self.f, d = self.b, e = -self.e, f = 1.0 / self.c)
+            .hlgish:
+                return TransferFunction(g = kind_marker(.hlginvish), a = 1.0 / self.a, b = 1.0 / self.b, c = 1.0 / self.c, d = self.d, e = self.e, f = self.f)
+            .hlginvish:
+                return TransferFunction(g = kind_marker(.hlgish), a = 1.0 / self.a, b = 1.0 / self.b, c = 1.0 / self.c, d = self.d, e = self.e, f = self.f)
+            .srgbish:
+                return self.invert_srgbish()
+
+    ## The sRGB-ish half of `invert`, solving for x in terms of y:
+    ##   y = (cx + f)         x < d
+    ##       (ax + b)^g + e   x >= d
+    ## The inverse can be expressed in the same piecewise form.
+    func invert_srgbish() -> TransferFunction?:
+        var inv = TransferFunction(g = 0.0, a = 0.0, b = 0.0, c = 0.0, d = 0.0, e = 0.0, f = 0.0)
+
+        # We'll start by finding the new threshold inv.d. In principle we should be able to
+        # find that by solving for y at x=d from either side. (If those two d values aren't
+        # the same, it's a discontinuous transfer function.)
+        let d_l = self.c * self.d + self.f
+        let d_r = powf_(self.a * self.d + self.b, self.g) + self.e
+        if fabsf_(d_l - d_r) > 1.0 / 512.0:
+            return none
+        inv.d = d_l
+
+        # When d=0, the linear section collapses to a point. We leave c,d,f all zero then.
+        if inv.d > 0.0:
+            # Inverting the linear section: (1/c)y - f/c = x.
+            inv.c = 1.0 / self.c
+            inv.f = -self.f / self.c
+
+        # The nonlinear section, with k = (1/a)^g moved inside the exponentiation:
+        #   (ky - ke)^1/g - b/a = x
+        let k = powf_(self.a, -self.g)
+        inv.g = 1.0 / self.g
+        inv.a = k
+        inv.b = -k * self.e
+        inv.e = -self.b / self.a
+
+        # Just like when fitting the curve, there's really no way to rescue a < 0.
+        if inv.a < 0.0:
+            return none
+        # On the other hand we can rescue an ad+b that's gone slightly negative here.
+        if inv.a * inv.d + inv.b < 0.0:
+            inv.b = -inv.a * inv.d
+
+        # That should usually make the inverse sRGB-ish, but there are situations where it
+        # still fails here, like non-finite parameter values.
+        if inv.kind() != .srgbish:
+            return none
+
+        # To preserve the invariant inv(src(1.0f)) == 1.0f, tweak e or f of the inverse,
+        # depending on which segment contains src(1.0f).
+        var s = self.eval(1.0)
+        if not isfinitef_(s):
+            return none
+        let sign: f32 = -1.0 if s < 0.0 else 1.0
+        s *= sign
+        if s < inv.d:
+            inv.f = 1.0 - sign * inv.c * s
+        else:
+            inv.e = 1.0 - sign * powf_(inv.a * s + inv.b, inv.g)
+
+        if inv.kind() != .srgbish:
+            return none
+        return inv

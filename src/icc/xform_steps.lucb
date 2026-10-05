@@ -1,0 +1,213 @@
+#==============================================================================================
+#
+#   icc/xform_steps - the steps between two color spaces, as Skia converts colors and pixels
+#
+#   DESCRIPTION:
+#       Port of Skia's SkColorSpaceXformSteps (src/core/SkColorSpaceXformSteps.cpp): what to
+#       do to a color in one color space and alpha type to have it in another, in order
+#       unpremultiply, linearize with the source's curve, the source's HLG OOTF, the gamut
+#       matrix, the destination's OOTF, encode with the inverse of the destination's curve,
+#       premultiply, each step present only when it changes something. PQ and HLG sources
+#       and destinations go through Skia's PQ-ish and HLG-ish curves with their luminance
+#       scale in the matrix. `apply` is SkColorSpaceXformSteps::apply(float*), the scalar
+#       path Skia converts colors with; a rasterizer runs the same steps per pixel with its
+#       own arithmetic (Skia's raster pipeline: SkColorSpaceXformSteps::apply(SkRasterPipeline*)).
+#
+#==============================================================================================
+
+## Skia's alpha types (SkAlphaType).
+pub enum AlphaType:
+    opaque
+    premul
+    unpremul
+
+## Which steps run (SkColorSpaceXformSteps::Flags).
+pub struct StepFlags:
+    pub var unpremul: bool
+    pub var linearize: bool
+    pub var src_ootf: bool
+    pub var gamut_transform: bool
+    pub var dst_ootf: bool
+    pub var encode: bool
+    pub var premul: bool
+
+## The steps from one color space to another (SkColorSpaceXformSteps).
+pub struct Steps:
+    pub var flags: StepFlags
+    ## The source's curve, when `flags.linearize`.
+    pub var src_tf: TransferFunction
+    ## The inverse of the destination's curve, when `flags.encode`.
+    pub var dst_tf_inv: TransferFunction
+    ## The gamut matrix, column-major as Skia stores it: the output's red is
+    ## m[0] r + m[3] g + m[6] b.
+    pub var src_to_dst_matrix: f32[9]
+    ## The OOTFs' luminance weights and gamma - 1, when `flags.src_ootf` or `flags.dst_ootf`.
+    pub var src_ootf: f32[4]
+    pub var dst_ootf: f32[4]
+
+## Skia's PQ-ish and HLG-ish curves for the PQ and HLG kinds (kPQish, kHLGish).
+let pq_ish: TransferFunction = TransferFunction(g = -2.0, a = -107.0 / 128.0, b = 1.0, c = 32.0 / 2523.0, d = 2413.0 / 128.0, e = -2392.0 / 128.0, f = 8192.0 / 1305.0)
+let hlg_ish: TransferFunction = TransferFunction(g = -3.0, a = 2.0, b = 2.0, c = 1.0 / 0.17883277, d = 0.28466892, e = 0.55991073, f = 0.0)
+
+## set_ootf_Y: the HLG OOTF's luminance weights (Rec. 2020's) in the primaries of `cs`.
+func ootf_y(cs: const ColorSpace*) -> f32[4]:
+    let rec2020_linear = ColorSpace.rgb(&tf_linear, &gamut_rec2020) else trap("linear Rec. 2020 is a color space")
+    let m = cs.gamut_transform_to(&rec2020_linear)
+    let y_rec2020: f32[3] = [0.262700, 0.678000, 0.059300]
+    var y: f32[4] = [0.0, 0.0, 0.0, 0.0]
+    for i in 0..<(usize)3:
+        y[i] = 0.0
+        for j in 0..<(usize)3:
+            y[i] += m.vals[j][i] * y_rec2020[j]
+    return y
+
+extend Steps:
+    ## The steps from `src` with `src_alpha` to `dst` with `dst_alpha`; a source left out is
+    ## sRGB, a destination left out is the source.
+    pub static func make(src_space: const ColorSpace*?, src_alpha: AlphaType, dst_space: const ColorSpace*?, dst_alpha: AlphaType) -> Steps:
+        var steps = Steps()
+        # Opaque outputs are treated as the same alpha type as the source input.
+        let dst_at = src_alpha if dst_alpha == .opaque else dst_alpha
+        let src_at = src_alpha
+
+        let srgb = ColorSpace.srgb()
+        let src: const ColorSpace* = src_space else &srgb
+        let dst: const ColorSpace* = dst_space else src
+
+        if src.same(dst) and src_at == dst_at:
+            return steps
+
+        let src_trfn = src.transfer_function
+        let dst_trfn = dst.transfer_function
+
+        # The amount that values in linear space are scaled to accommodate peak luminance
+        # and HDR reference white luminance.
+        var scale_factor: f32 = 1.0
+
+        match src_trfn.kind():
+            .pq:
+                # PQ is always scaled by a peak luminance of 10,000 nits, then divided by the
+                # HDR reference white luminance (a).
+                scale_factor *= 10000.0 / src_trfn.a
+                steps.src_tf = pq_ish
+                steps.flags.linearize = true
+            .hlg:
+                # HLG is scaled by the peak luminance (b), then divided by the HDR reference
+                # white luminance (a).
+                scale_factor *= src_trfn.b / src_trfn.a
+                steps.flags.linearize = true
+                # The HLG-ish curve scaled by 1/12.
+                steps.src_tf = hlg_ish
+                steps.src_tf.f = 1.0 / 12.0 - 1.0
+                # If the system gamma is not 1.0, then compute the parameters for the OOTF.
+                if src_trfn.c != 1.0:
+                    steps.flags.src_ootf = true
+                    steps.src_ootf = ootf_y(src)
+                    steps.src_ootf[3] = src_trfn.c - 1.0
+            _:
+                steps.flags.linearize = not same_transfer_function(&src_trfn, &tf_linear)
+                if steps.flags.linearize:
+                    steps.src_tf = src_trfn
+
+        match dst_trfn.kind():
+            .pq:
+                # This is the inverse of the treatment of source PQ.
+                scale_factor /= 10000.0 / dst_trfn.a
+                steps.flags.encode = true
+                steps.dst_tf_inv = pq_ish.invert() else trap("Skia's PQ-ish curve inverts")
+            .hlg:
+                scale_factor /= dst_trfn.b / dst_trfn.a
+                steps.flags.encode = true
+                var hlg = hlg_ish
+                hlg.f = 1.0 / 12.0 - 1.0
+                steps.dst_tf_inv = hlg.invert() else trap("Skia's HLG-ish curve inverts")
+                if dst_trfn.c != 1.0:
+                    steps.flags.dst_ootf = true
+                    steps.dst_ootf = ootf_y(dst)
+                    steps.dst_ootf[3] = 1.0 / dst_trfn.c - 1.0
+            _:
+                steps.flags.encode = not same_transfer_function(&dst_trfn, &tf_linear)
+                if steps.flags.encode:
+                    steps.dst_tf_inv = dst.inverse_transfer_function()
+
+        steps.flags.unpremul = src_at == .premul
+        steps.flags.gamut_transform = not same_matrix(&src.to_xyzd50, &dst.to_xyzd50) or scale_factor != 1.0
+        steps.flags.premul = src_at != .opaque and dst_at == .premul
+
+        if steps.flags.gamut_transform:
+            let src_to_dst = src.gamut_transform_to(dst)
+            steps.src_to_dst_matrix[0] = src_to_dst.vals[0][0] * scale_factor
+            steps.src_to_dst_matrix[1] = src_to_dst.vals[1][0] * scale_factor
+            steps.src_to_dst_matrix[2] = src_to_dst.vals[2][0] * scale_factor
+            steps.src_to_dst_matrix[3] = src_to_dst.vals[0][1] * scale_factor
+            steps.src_to_dst_matrix[4] = src_to_dst.vals[1][1] * scale_factor
+            steps.src_to_dst_matrix[5] = src_to_dst.vals[2][1] * scale_factor
+            steps.src_to_dst_matrix[6] = src_to_dst.vals[0][2] * scale_factor
+            steps.src_to_dst_matrix[7] = src_to_dst.vals[1][2] * scale_factor
+            steps.src_to_dst_matrix[8] = src_to_dst.vals[2][2] * scale_factor
+
+        # If the source and destination OOTFs cancel each other out, skip both.
+        if steps.flags.src_ootf and not steps.flags.gamut_transform and steps.flags.dst_ootf:
+            if (steps.src_ootf[3] + 1.0) * (steps.dst_ootf[3] + 1.0) == 1.0:
+                steps.flags.src_ootf = false
+                steps.flags.dst_ootf = false
+
+        # If we linearize then immediately reencode with the same transfer function, skip both.
+        if steps.flags.linearize and not steps.flags.src_ootf and not steps.flags.gamut_transform and not steps.flags.dst_ootf and steps.flags.encode and same_transfer_function(&src.transfer_function, &dst.transfer_function):
+            steps.flags.linearize = false
+            steps.flags.encode = false
+
+        # Skip unpremul...premul if there are no non-linear operations between.
+        if steps.flags.unpremul and not steps.flags.linearize and not steps.flags.encode and steps.flags.premul:
+            steps.flags.unpremul = false
+            steps.flags.premul = false
+        return steps
+
+    ## Whether no step runs.
+    pub func is_identity() -> bool:
+        let f = self.flags
+        return not (f.unpremul or f.linearize or f.src_ootf or f.gamut_transform or f.dst_ootf or f.encode or f.premul)
+
+    ## The steps on one RGBA color (SkColorSpaceXformSteps::apply(float*)), with skcms's
+    ## evaluation of the curves.
+    pub func apply(rgba: f32[4]) -> f32[4]:
+        var c = rgba
+        if self.flags.unpremul:
+            # sk_ieee_float_divide, and a non-finite inverse becomes 0.
+            var inv_a = 1.0 / c[3]
+            if not (inv_a * 0.0 == 0.0):
+                inv_a = 0.0
+            c[0] *= inv_a
+            c[1] *= inv_a
+            c[2] *= inv_a
+        if self.flags.linearize:
+            c[0] = self.src_tf.eval(c[0])
+            c[1] = self.src_tf.eval(c[1])
+            c[2] = self.src_tf.eval(c[2])
+        if self.flags.src_ootf:
+            c = apply_ootf(self.src_ootf, c)
+        if self.flags.gamut_transform:
+            let temp: f32[3] = [c[0], c[1], c[2]]
+            for i in 0..<(usize)3:
+                c[i] = self.src_to_dst_matrix[i] * temp[0] + self.src_to_dst_matrix[3 + i] * temp[1] + self.src_to_dst_matrix[6 + i] * temp[2]
+        if self.flags.dst_ootf:
+            c = apply_ootf(self.dst_ootf, c)
+        if self.flags.encode:
+            c[0] = self.dst_tf_inv.eval(c[0])
+            c[1] = self.dst_tf_inv.eval(c[1])
+            c[2] = self.dst_tf_inv.eval(c[2])
+        if self.flags.premul:
+            c[0] *= c[3]
+            c[1] *= c[3]
+            c[2] *= c[3]
+        return c
+
+## The OOTF of `apply`: the color scaled by its luminance to the power gamma - 1 (std::pow).
+func apply_ootf(ootf: f32[4], rgba: f32[4]) -> f32[4]:
+    var c = rgba
+    let y = ootf[0] * c[0] + ootf[1] * c[1] + ootf[2] * c[2]
+    let y_to_gamma_minus_1 = math32.pow(y, ootf[3])
+    c[0] *= y_to_gamma_minus_1
+    c[1] *= y_to_gamma_minus_1
+    c[2] *= y_to_gamma_minus_1
+    return c

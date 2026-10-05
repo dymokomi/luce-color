@@ -1,0 +1,133 @@
+#==============================================================================================
+#
+#   icc/matrix - 3x3 matrices: inverse, product, white adaptation and primaries to XYZ D50
+#
+#   DESCRIPTION:
+#       Port of skcms.cc's skcms_Matrix3x3_invert (in f64, as skcms does), skcms_Matrix3x3_
+#       concat, mv_mul, skcms_AdaptToXYZD50 (Bradford adaptation of a white to D50) and
+#       skcms_PrimariesToXYZD50.
+#
+#==============================================================================================
+
+## skcms_Vector3.
+struct Vector3:
+    var vals: f32[3]
+
+## mv_mul: `m` times the column vector `v`.
+func mv_mul(m: const Matrix3x3*, v: const Vector3*) -> Vector3:
+    var dst = Vector3(vals = [0.0, 0.0, 0.0])
+    for row in 0..<(usize)3:
+        dst.vals[row] = m.vals[row][0] * v.vals[0] + m.vals[row][1] * v.vals[1] + m.vals[row][2] * v.vals[2]
+    return dst
+
+## is_zero_to_one.
+func is_zero_to_one(x: f32) -> bool:
+    return 0.0 <= x and x <= 1.0
+
+extend Matrix3x3:
+    ## The inverse (skcms_Matrix3x3_invert), computed in f64; none when the matrix is
+    ## singular or its inverse is not finite in f32.
+    pub func invert() -> Matrix3x3?:
+        let a00 = (f64)self.vals[0][0]
+        let a01 = (f64)self.vals[1][0]
+        let a02 = (f64)self.vals[2][0]
+        let a10 = (f64)self.vals[0][1]
+        let a11 = (f64)self.vals[1][1]
+        let a12 = (f64)self.vals[2][1]
+        let a20 = (f64)self.vals[0][2]
+        let a21 = (f64)self.vals[1][2]
+        let a22 = (f64)self.vals[2][2]
+
+        var b0 = a00 * a11 - a01 * a10
+        var b1 = a00 * a12 - a02 * a10
+        var b2 = a01 * a12 - a02 * a11
+        var b3 = a20
+        var b4 = a21
+        var b5 = a22
+
+        let determinant = b0 * b5 - b1 * b4 + b2 * b3
+        if determinant == 0.0:
+            return none
+
+        let invdet = 1.0 / determinant
+        # FLT_MAX.
+        let flt_max: f64 = 3.40282346638528859811704183484516925440e+38
+        if invdet > flt_max or invdet < -flt_max or not isfinitef_((f32)invdet):
+            return none
+
+        b0 *= invdet
+        b1 *= invdet
+        b2 *= invdet
+        b3 *= invdet
+        b4 *= invdet
+        b5 *= invdet
+
+        var dst = zero_matrix()
+        dst.vals[0][0] = (f32)(a11 * b5 - a12 * b4)
+        dst.vals[1][0] = (f32)(a02 * b4 - a01 * b5)
+        dst.vals[2][0] = (f32)b2
+        dst.vals[0][1] = (f32)(a12 * b3 - a10 * b5)
+        dst.vals[1][1] = (f32)(a00 * b5 - a02 * b3)
+        dst.vals[2][1] = (f32)(-b1)
+        dst.vals[0][2] = (f32)(a10 * b4 - a11 * b3)
+        dst.vals[1][2] = (f32)(a01 * b3 - a00 * b4)
+        dst.vals[2][2] = (f32)b0
+
+        for r in 0..<(usize)3:
+            for c in 0..<(usize)3:
+                if not isfinitef_(dst.vals[r][c]):
+                    return none
+        return dst
+
+    ## The product `self * other` (skcms_Matrix3x3_concat).
+    pub func concat(other: const Matrix3x3*) -> Matrix3x3:
+        var m = zero_matrix()
+        for r in 0..<(usize)3:
+            for c in 0..<(usize)3:
+                m.vals[r][c] = self.vals[r][0] * other.vals[0][c] + self.vals[r][1] * other.vals[1][c] + self.vals[r][2] * other.vals[2][c]
+        return m
+
+## The Bradford adaptation from the white (wx, wy) to D50 (skcms_AdaptToXYZD50), or none
+## for a white outside 0..1.
+pub func adapt_to_xyzd50(wx: f32, wy: f32) -> Matrix3x3?:
+    if not is_zero_to_one(wx) or not is_zero_to_one(wy):
+        return none
+
+    # Assumes that Y is 1.0f.
+    let w_xyz = Vector3(vals = [wx / wy, 1.0, (1.0 - wx - wy) / wy])
+
+    # Now convert toXYZ matrix to toXYZD50.
+    let w_xyzd50 = Vector3(vals = [0.96422, 1.0, 0.82521])
+
+    # Calculate the chromatic adaptation matrix. We will use the Bradford method, thus the
+    # matrices below. The Bradford method is used by Adobe and is widely considered to be
+    # the best.
+    let xyz_to_lms = Matrix3x3(vals = [[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.0367], [0.0389, -0.0685, 1.0296]])
+    let lms_to_xyz = Matrix3x3(vals = [[0.9869929, -0.1470543, 0.1599627], [0.4323053, 0.5183603, 0.0492912], [-0.0085287, 0.0400428, 0.9684867]])
+
+    let src_cone = mv_mul(&xyz_to_lms, &w_xyz)
+    let dst_cone = mv_mul(&xyz_to_lms, &w_xyzd50)
+
+    var to_xyzd50 = Matrix3x3(vals = [[dst_cone.vals[0] / src_cone.vals[0], 0.0, 0.0], [0.0, dst_cone.vals[1] / src_cone.vals[1], 0.0], [0.0, 0.0, dst_cone.vals[2] / src_cone.vals[2]]])
+    to_xyzd50 = to_xyzd50.concat(&xyz_to_lms)
+    return lms_to_xyz.concat(&to_xyzd50)
+
+## The matrix from linear RGB with these xy primaries and white to XYZ D50
+## (skcms_PrimariesToXYZD50), or none for coordinates outside 0..1 or singular primaries.
+pub func primaries_to_xyzd50(rx: f32, ry: f32, gx: f32, gy: f32, bx: f32, by: f32, wx: f32, wy: f32) -> Matrix3x3?:
+    if not is_zero_to_one(rx) or not is_zero_to_one(ry) or not is_zero_to_one(gx) or not is_zero_to_one(gy) or not is_zero_to_one(bx) or not is_zero_to_one(by) or not is_zero_to_one(wx) or not is_zero_to_one(wy):
+        return none
+
+    # First, we need to convert xy values (primaries) to XYZ.
+    let primaries = Matrix3x3(vals = [[rx, gx, bx], [ry, gy, by], [1.0 - rx - ry, 1.0 - gx - gy, 1.0 - bx - by]])
+    let primaries_inv = primaries.invert() else return none
+
+    # Assumes that Y is 1.0f.
+    let w_xyz = Vector3(vals = [wx / wy, 1.0, (1.0 - wx - wy) / wy])
+    let scale = mv_mul(&primaries_inv, &w_xyz)
+
+    var to_xyz = Matrix3x3(vals = [[scale.vals[0], 0.0, 0.0], [0.0, scale.vals[1], 0.0], [0.0, 0.0, scale.vals[2]]])
+    to_xyz = primaries.concat(&to_xyz)
+
+    let dx_to_d50 = adapt_to_xyzd50(wx, wy) else return none
+    return dx_to_d50.concat(&to_xyz)

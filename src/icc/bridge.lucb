@@ -1,0 +1,66 @@
+#==============================================================================================
+#
+#   icc/bridge - skcms's and Skia's types against this library's own
+#
+#   DESCRIPTION:
+#       A transfer function for each `transfer.Transfer` and back, the f32 matrix to XYZ D50
+#       of a set of `xyz.Primaries` (through skcms_PrimariesToXYZD50, so it is skcms's to the
+#       bit) and `xyz.Matrix3` in both directions, and the Skia color space of a
+#       `space.ColorSpace`. PQ is relative to 10 000 cd/m2 and HLG to its nominal peak in the
+#       `transfer` module, so their transfer functions put the reference white there and
+#       leave out the OOTF: a pixel converted between such spaces keeps its linear value.
+#
+#==============================================================================================
+import transfer
+import xyz
+import space
+
+## The transfer function of a `transfer.Transfer`.
+pub func transfer_function(curve: transfer.Transfer) -> TransferFunction:
+    match curve:
+        .linear: return tf_linear
+        .srgb: return tf_srgb
+        .gamma_18: return tf_prophoto_rgb
+        .gamma_22: return tf_2dot2
+        .gamma_24: return tf_rec709
+        .pq: return TransferFunction.pq(10000.0)
+        .hlg: return TransferFunction.hlg(1000.0, 1000.0, 1.0)
+        _: return tf_linear
+
+## The `transfer.Transfer` a transfer function is, bit for bit, or none.
+pub func transfer_of(tf: const TransferFunction*) -> transfer.Transfer?:
+    let all: transfer.Transfer[7] = [.linear, .srgb, .gamma_18, .gamma_22, .gamma_24, .pq, .hlg]
+    for curve in all:
+        let candidate = transfer_function(curve)
+        if same_transfer_function(tf, &candidate):
+            return curve
+    return none
+
+## The matrix from linear RGB in `primaries` to XYZ D50, as skcms computes it in f32.
+pub func primaries_matrix(primaries: xyz.Primaries) -> Matrix3x3?:
+    return primaries_to_xyzd50((f32)primaries.red.x, (f32)primaries.red.y, (f32)primaries.green.x, (f32)primaries.green.y, (f32)primaries.blue.x, (f32)primaries.blue.y, (f32)primaries.white.x, (f32)primaries.white.y)
+
+extend Matrix3x3:
+    ## As an `xyz.Matrix3`.
+    pub func matrix3() -> xyz.Matrix3:
+        var m = xyz.Matrix3()
+        for r in 0..<(usize)3:
+            for c in 0..<(usize)3:
+                m.m[r * 3 + c] = (f64)self.vals[r][c]
+        return m
+
+    ## An `xyz.Matrix3` rounded to f32.
+    pub static func from_matrix3(m: xyz.Matrix3) -> Matrix3x3:
+        var out = zero_matrix()
+        for r in 0..<(usize)3:
+            for c in 0..<(usize)3:
+                out.vals[r][c] = (f32)m.m[r * 3 + c]
+        return out
+
+extend ColorSpace:
+    ## The Skia color space of a `space.ColorSpace`: its primaries' matrix to XYZ D50 and
+    ## its transfer function, through SkColorSpace::MakeRGB.
+    pub static func from_space(s: space.ColorSpace) -> ColorSpace?:
+        let matrix = primaries_matrix(s.primaries) else return none
+        let tf = transfer_function(s.transfer)
+        return ColorSpace.rgb(&tf, &matrix)

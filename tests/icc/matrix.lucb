@@ -1,0 +1,26 @@
+#==============================================================================================
+#
+#   tests/icc/matrix - inverses, products, adaptation and primaries
+#
+#==============================================================================================
+
+test "matrices invert and multiply as skcms's do":
+    let inv = srgb_to_xyzd50.invert() else trap("sRGB's matrix inverts")
+    assert(matrix_has_bits(&inv, [0x4048954b, 0xbfcf06b7, 0xbefb344d, 0xbf7a91ce, 0x3ff548a6, 0x3d0907cf, 0x3d936bd9, 0xbe6a7b44, 0x3fb3e3a9]))
+    let product = srgb_to_xyzd50.concat(&inv)
+    for r in 0..<(usize)3:
+        for col in 0..<(usize)3:
+            assert(near(product.vals[r][col], 1.0 if r == col else 0.0, 0.000001))
+    let singular = Matrix3x3(vals = [[1.0, 2.0, 3.0], [2.0, 4.0, 6.0], [0.0, 0.0, 1.0]])
+    assert(singular.invert() == none)
+
+test "whites adapt to D50 and primaries give skcms's matrices":
+    let adapt = adapt_to_xyzd50(0.3127, 0.329) else trap("D65 adapts")
+    assert(matrix_has_bits(&adapt, [0x3f862030, 0x3cbba824, 0xbd4d76e6, 0x3cf23db9, 0x3f7d8fd0, 0xbc8bc496, 0xbc17655a, 0x3c76a088, 0x3f40812b]))
+    assert(adapt_to_xyzd50(1.5, 0.3) == none)
+    let rec709 = primaries_rec709.to_xyzd50() else trap("Rec. 709 has a matrix")
+    assert(matrix_has_bits(&rec709, [0x3edf3f16, 0x3ec52bf3, 0x3e128676, 0x3e63d171, 0x3f378698, 0x3d7850fc, 0x3c642b71, 0x3dc6d83b, 0x3f36d541]))
+    let p3 = primaries_smpte_eg_432_1.to_xyzd50() else trap("P3 has a matrix")
+    assert(matrix_has_bits(&p3, [0x3f03ddbc, 0x3e957c67, 0x3e20ecbe, 0x3e76f860, 0x3f313668, 0x3d885c11, 0xba898c54, 0x3d2b8c34, 0x3f48ccfa]))
+    # Collinear primaries have no matrix.
+    assert(primaries_to_xyzd50(0.1, 0.1, 0.2, 0.2, 0.3, 0.3, 0.3127, 0.329) == none)

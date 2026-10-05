@@ -1,0 +1,25 @@
+ICC profiles of the icc module's tests (tests/icc, and tests/run.py's oracle comparisons).
+
+Written by tests/make_icc_fixtures.py (no third-party data):
+  bad-*.icc, curv-gamma.icc, gray-ktrc.icc, identity-tables.icc, mab-xyz.icc, mft1-cmyk.icc,
+  mft2-lab.icc, para-types.icc, para-types-12.icc
+
+From Ladybird (Tests/LibGfx/test-inputs, at the luce-browser pin; BSD 2-Clause License,
+LICENSE-ladybird):
+  p3-v4.icc, oss-fuzz-testcase-57426.icc, oss-fuzz-testcase-59551.icc,
+  oss-fuzz-testcase-60281.icc                      icc/*.icc as they are
+  ladybird-icc-v2.icc, ladybird-icc-v4.icc        the profiles embedded in icc/icc-v2.png and
+                                                  icc/icc-v4.jpg
+  ladybird-asset-120.icc                          the profile embedded in Tests/LibWeb/Assets/120.png
+
+From the web-platform-tests (as imported by Ladybird's Tests/LibWeb; 3-Clause BSD License,
+LICENSE-wpt.md), the profiles embedded in:
+  wpt-swap-990000.icc       css/css-color/support/swap-990000-iCCP.png (sRGB, red and green swapped)
+  wpt-cicp-and-iccp.icc     png/support/cICP-and-iCCP.png (a profile skcms refuses)
+  wpt-color-palette.icc     css/filter-effects/support/color-palette.png
+  wpt-blending-red.icc      css/compositing/background-blending/support/red.png (Adobe RGB)
+
+expected.txt is skcms's dump of every profile here (luce-browser-tools/oracles/luce-color/icc,
+skcms_oracle: skcms of the Skia Ladybird pins, built portable without contraction);
+spaces.txt is Skia's (skia_oracle: SkColorSpace::Make and Ladybird's load_from_icc_bytes);
+formats.sha256 hashes skcms's `--formats` dumps.

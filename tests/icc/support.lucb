@@ -1,0 +1,46 @@
+#==============================================================================================
+#
+#   tests/icc/support - helpers of the icc tests: the test profiles and bit comparisons
+#
+#   DESCRIPTION:
+#       The profiles live in tests/fixtures/icc (see NOTICE there); `luce-base test` runs
+#       from the repository root (tests/run.py). The exact values the tests expect were
+#       printed by skcms itself (luce-browser-tools/oracles/luce-color/icc), built portable
+#       and without contraction, which this port follows to the bit.
+#
+#==============================================================================================
+from luce_std import files
+import c as libc
+import memory
+import strings
+
+## The bytes of test profile `name`, kept in the C heap for the run.
+func test_profile_bytes(name: str) -> const u8[]:
+    var buffer: u8[256]
+    let path = strings.format(buffer, f"tests/fixtures/icc/{name}") else trap("a test path is too long")
+    with memory.heap:
+        return (files.read((libc.str)path) else trap("cannot read a test profile")).value
+
+## Test profile `name`, parsed.
+func test_profile(name: str) -> Profile:
+    return parse(test_profile_bytes(name)) else trap("a test profile parses")
+
+## Whether `x` has the bits `expected`.
+func has_bits(x: f32, expected: u32) -> bool:
+    return x.bits() == expected
+
+## Whether a transfer function has the bits g, a, b, c, d, e, f.
+func tf_has_bits(tf: const TransferFunction*, expected: u32[7]) -> bool:
+    return tf.g.bits() == expected[0] and tf.a.bits() == expected[1] and tf.b.bits() == expected[2] and tf.c.bits() == expected[3] and tf.d.bits() == expected[4] and tf.e.bits() == expected[5] and tf.f.bits() == expected[6]
+
+## Whether a matrix has these bits, row by row.
+func matrix_has_bits(m: const Matrix3x3*, expected: u32[9]) -> bool:
+    for r in 0..<(usize)3:
+        for col in 0..<(usize)3:
+            if m.vals[r][col].bits() != expected[r * 3 + col]:
+                return false
+    return true
+
+## Whether two floats are within `tolerance`.
+func near(x: f32, y: f32, tolerance: f32) -> bool:
+    return math32.abs(x - y) <= tolerance

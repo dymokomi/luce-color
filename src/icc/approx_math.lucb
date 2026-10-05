@@ -1,0 +1,131 @@
+#==============================================================================================
+#
+#   icc/approx_math - skcms's approximate logarithms, exponentials and powers
+#
+#   DESCRIPTION:
+#       Two families, as skcms has them. The scalar ones of skcms.cc (log2f_, exp2f_, powf_,
+#       logf_, expf_) evaluate transfer functions while parsing, inverting and fitting; the
+#       pipeline ones of Transform_inl.h (approx_log2, approx_exp2, approx_pow, ...) run in
+#       skcms_Transform's ops. They differ at the edges: exp2f_ saturates before its integer
+#       conversion and powf_ maps x <= 0 to 0, where approx_exp2 clamps the bits and
+#       approx_pow passes 0 and 1 through. Every sum is computed in skcms's order.
+#
+#==============================================================================================
+
+# mark: Portable scalar math (skcms.cc) ========================================================
+
+## floorf_ (skcms_internals.h): the floor through a truncating integer round trip.
+func floorf_(x: f32) -> f32:
+    let roundtrip = (f32)(i32)x
+    return roundtrip - 1.0 if roundtrip > x else roundtrip
+
+## fabsf_.
+func fabsf_(x: f32) -> f32:
+    return -x if x < 0.0 else x
+
+## fmaxf_ and fminf_: the first operand wins ties and NaNs as in skcms.
+func fmaxf_(x: f32, y: f32) -> f32:
+    return x if x > y else y
+
+func fminf_(x: f32, y: f32) -> f32:
+    return x if x < y else y
+
+## isfinitef_: 0 == x * 0, false for infinities and NaN.
+func isfinitef_(x: f32) -> bool:
+    return 0.0 == x * 0.0
+
+## The float one unit in the last place below `x` (for positive `x`).
+func minus_1_ulp(x: f32) -> f32:
+    return f32.bits(x.bits() -% 1)
+
+## The infinity skcms calls INFINITY_.
+let infinity_: f32 = f32.bits(0x7f800000)
+
+## log2f_: the exponent refined by the mantissa.
+func log2f_(x: f32) -> f32:
+    let bits = (i32)x.bits()
+    let e = (f32)bits * (1.0 / 8388608.0)
+    let m = f32.bits(((u32)bits & 0x007fffff) | 0x3f000000)
+    return e - 124.225514990 - 1.498030302 * m - 1.725879990 / (0.3520887068 + m)
+
+## logf_.
+func logf_(x: f32) -> f32:
+    let ln2: f32 = 0.69314718
+    return ln2 * log2f_(x)
+
+## exp2f_.
+func exp2f_(x: f32) -> f32:
+    if x > 128.0:
+        return infinity_
+    elif x < -127.0:
+        return 0.0
+    let fract = x - floorf_(x)
+    let fbits = 8388608.0 * (x + 121.274057500 - 1.490129070 * fract + 27.728023300 / (4.84252568 - fract))
+    # INT_MAX is not exactly representable as a float, so it counts as infinite; negative
+    # values are underflow and clamp to zero.
+    if fbits >= 2147483648.0:
+        return infinity_
+    elif fbits < 0.0:
+        return 0.0
+    return f32.bits((u32)(i32)fbits)
+
+## powf_: x^y for x > 0, 0 for x <= 0 and 1 for x == 1.
+func powf_(x: f32, y: f32) -> f32:
+    if x <= 0.0:
+        return 0.0
+    if x == 1.0:
+        return 1.0
+    return exp2f_(log2f_(x) * y)
+
+## expf_.
+func expf_(x: f32) -> f32:
+    let log2_e: f32 = 1.4426950408889634074
+    return exp2f_(log2_e * x)
+
+# mark: Pipeline math (Transform_inl.h) ========================================================
+
+## max_ and min_ of the portable pipeline.
+func max_(x: f32, y: f32) -> f32:
+    return y if x < y else x
+
+func min_(x: f32, y: f32) -> f32:
+    return y if x > y else x
+
+## approx_log2.
+func approx_log2(x: f32) -> f32:
+    let bits = (i32)x.bits()
+    let e = (f32)bits * (1.0 / 8388608.0)
+    let m = f32.bits(((u32)bits & 0x007fffff) | 0x3f000000)
+    return e - 124.225514990 - 1.498030302 * m - 1.725879990 / (0.3520887068 + m)
+
+## approx_log.
+func approx_log(x: f32) -> f32:
+    let ln2: f32 = 0.69314718
+    return ln2 * approx_log2(x)
+
+## approx_exp2: the bits clamped to 0..+inf, then truncated to an integer.
+func approx_exp2(x: f32) -> f32:
+    let fract = x - floorf_(x)
+    let fbits = 8388608.0 * (x + 121.274057500 - 1.490129070 * fract + 27.728023300 / (4.84252568 - fract))
+    let clamped = min_(max_(fbits, 0.0), 2139095040.0)
+    return f32.bits((u32)(i32)clamped)
+
+## approx_pow: 0 and 1 pass through.
+func approx_pow(x: f32, y: f32) -> f32:
+    if x == 0.0 or x == 1.0:
+        return x
+    return approx_exp2(approx_log2(x) * y)
+
+## approx_exp.
+func approx_exp(x: f32) -> f32:
+    let log2_e: f32 = 1.4426950408889634074
+    return approx_exp2(log2_e * x)
+
+## |x| with its sign bit kept apart (strip_sign) and put back (apply_sign).
+func strip_sign(x: f32) -> (f32, u32):
+    let bits = x.bits()
+    let sign = bits & 0x80000000
+    return (f32.bits(bits ^ sign), sign)
+
+func apply_sign(x: f32, sign: u32) -> f32:
+    return f32.bits(sign | x.bits())

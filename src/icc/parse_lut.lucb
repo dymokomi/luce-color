@@ -1,0 +1,390 @@
+#==============================================================================================
+#
+#   icc/parse_lut - the lookup-table tags: mft1, mft2, mAB and mBA
+#
+#   DESCRIPTION:
+#       Port of skcms.cc's read_mft_common, init_tables, read_tag_mft1, read_tag_mft2,
+#       read_curves, read_tag_mab, read_tag_mba, read_a2b and read_b2a. The legacy
+#       lutAtoBType/lutBtoAType (mft1 with 8-bit tables, mft2 with 16-bit ones) have input
+#       tables, a grid and output tables; the v4 lutAToBType/lutBToAType (mAB, mBA) have
+#       "A" curves and a grid, "M" curves and a matrix, and "B" curves, each optional but the
+#       B curves. skcms skips the mft matrix, which must be the identity unless the input is
+#       PCS XYZ, and reads the tables in place.
+#
+#==============================================================================================
+
+# mark: mft1 and mft2 ==========================================================================
+
+## The tables of an mft1 or mft2 tag, before they go into an A2B or B2A.
+struct MftTables:
+    var input_channels: u32
+    var output_channels: u32
+    var grid_points: u8[4]
+    var input_curves: Curve[4]
+    var output_curves: Curve[4]
+    var grid_8: const u8[]
+    var grid_16: const u8[]
+
+# Offsets in the mft layouts: type, reserved, input channels, output channels, grid points,
+# reserved, the 3x3 matrix; mft2 then has its table sizes.
+let mft_input_channels: usize = 8
+let mft_output_channels: usize = 9
+let mft_grid_points: usize = 10
+let mft1_tables: u64 = 48
+let mft2_input_entries: u64 = 48
+let mft2_output_entries: u64 = 50
+let mft2_tables: u64 = 52
+
+## init_tables: the input tables, the grid and the output tables laid out one after another
+## from `base`, each `byte_width` bytes an entry.
+func init_tables(data: const u8[], base: u64, max_tables_len: u64, byte_width: u32, input_table_entries: u32, output_table_entries: u32, out: MftTables*) -> bool:
+    # byte_width is 1 or 2, [input|output]_table_entries are in [2, 4096], so no overflow.
+    let byte_len_per_input_table = input_table_entries * byte_width
+    let byte_len_per_output_table = output_table_entries * byte_width
+
+    # [input|output]_channels are <= 4, so still no overflow.
+    let byte_len_all_input_tables = out.input_channels * byte_len_per_input_table
+    let byte_len_all_output_tables = out.output_channels * byte_len_per_output_table
+
+    var grid_size = (u64)out.output_channels * (u64)byte_width
+    for axis in 0..<(usize)out.input_channels:
+        grid_size *= (u64)out.grid_points[axis]
+
+    if max_tables_len < (u64)byte_len_all_input_tables + grid_size + (u64)byte_len_all_output_tables:
+        return false
+
+    for i in 0..<(usize)out.input_channels:
+        let start = (usize)base + i * (usize)byte_len_per_input_table
+        let entries = data[start..<start + (usize)byte_len_per_input_table]
+        out.input_curves[i].table_entries = input_table_entries
+        if byte_width == 1:
+            out.input_curves[i].table_8 = entries
+        else:
+            out.input_curves[i].table_16 = entries
+
+    let grid_start = (usize)base + (usize)byte_len_all_input_tables
+    let grid = data[grid_start..<grid_start + (usize)grid_size]
+    if byte_width == 1:
+        out.grid_8 = grid
+    else:
+        out.grid_16 = grid
+
+    let output_base = grid_start + (usize)grid_size
+    for i in 0..<(usize)out.output_channels:
+        let start = output_base + i * (usize)byte_len_per_output_table
+        let entries = data[start..<start + (usize)byte_len_per_output_table]
+        out.output_curves[i].table_entries = output_table_entries
+        if byte_width == 1:
+            out.output_curves[i].table_8 = entries
+        else:
+            out.output_curves[i].table_16 = entries
+    return true
+
+## read_tag_mft1 and read_tag_mft2 after read_mft_common's channel checks, which the caller
+## makes for its direction: the grid points of every input channel, and the tables.
+func read_mft(tag: const Tag*, out: MftTables*) -> bool:
+    for i in 0..<(usize)out.input_channels:
+        out.grid_points[i] = tag.data[mft_grid_points]
+    # The grid only makes sense with at least two points along each axis.
+    if out.grid_points[0] < 2:
+        return false
+    if tag.kind == signature_mft1:
+        return init_tables(tag.data, mft1_tables, (u64)tag.size - mft1_tables, 1, 256, 256, out)
+    let input_table_entries = read_big_u16(tag.data, mft2_input_entries)
+    let output_table_entries = read_big_u16(tag.data, mft2_output_entries)
+    # ICC spec mandates that 2 <= table_entries <= 4096.
+    if input_table_entries < 2 or input_table_entries > 4096 or output_table_entries < 2 or output_table_entries > 4096:
+        return false
+    return init_tables(tag.data, mft2_tables, (u64)tag.size - mft2_tables, 2, input_table_entries, output_table_entries, out)
+
+## The smallest size of the tag's layout, before its tables.
+func mft_fixed_size(tag: const Tag*) -> u64:
+    return mft1_tables if tag.kind == signature_mft1 else mft2_tables
+
+## An mft1 or mft2 tag as an A2B: exactly three output channels, one to four inputs. MFT
+## matrices are applied before the first set of curves, but must be identity unless the
+## input is PCSXYZ; skcms doesn't support PCSXYZ inputs, so the matrix is ignored.
+func read_mft_a2b(tag: const Tag*, a2b: A2B*) -> bool:
+    if (u64)tag.size < mft_fixed_size(tag):
+        return false
+    var tables = MftTables(input_channels = (u32)tag.data[mft_input_channels], output_channels = (u32)tag.data[mft_output_channels])
+    a2b.matrix_channels = 0
+    a2b.input_channels = tables.input_channels
+    a2b.output_channels = tables.output_channels
+    # We require exactly three (ie XYZ/Lab/RGB) output channels.
+    if a2b.output_channels != 3:
+        return false
+    # We require at least one, and no more than four (ie CMYK) input channels.
+    if a2b.input_channels < 1 or a2b.input_channels > 4:
+        return false
+    if not read_mft(tag, &tables):
+        return false
+    a2b.grid_points = tables.grid_points
+    a2b.grid_8 = tables.grid_8
+    a2b.grid_16 = tables.grid_16
+    for i in 0..<(usize)4:
+        a2b.input_curves[i] = tables.input_curves[i]
+    for i in 0..<(usize)3:
+        a2b.output_curves[i] = tables.output_curves[i]
+    return true
+
+## An mft1 or mft2 tag as a B2A: exactly three input channels (XYZ), three (RGB) or four
+## (CMYK) outputs.
+func read_mft_b2a(tag: const Tag*, b2a: B2A*) -> bool:
+    if (u64)tag.size < mft_fixed_size(tag):
+        return false
+    var tables = MftTables(input_channels = (u32)tag.data[mft_input_channels], output_channels = (u32)tag.data[mft_output_channels])
+    b2a.matrix_channels = 0
+    b2a.input_channels = tables.input_channels
+    b2a.output_channels = tables.output_channels
+    if b2a.input_channels != 3:
+        return false
+    if b2a.output_channels < 3 or b2a.output_channels > 4:
+        return false
+    if not read_mft(tag, &tables):
+        return false
+    b2a.grid_points = tables.grid_points
+    b2a.grid_8 = tables.grid_8
+    b2a.grid_16 = tables.grid_16
+    for i in 0..<(usize)3:
+        b2a.input_curves[i] = tables.input_curves[i]
+    for i in 0..<(usize)4:
+        b2a.output_curves[i] = tables.output_curves[i]
+    return true
+
+# mark: mAB and mBA ============================================================================
+
+## read_curves: `count` curves one after another from `curve_offset`, each padded to four
+## bytes.
+func read_curves(data: const u8[], size: u32, start: u32, curves: Curve[]) -> bool:
+    var curve_offset = start
+    for i in 0..<curves.length:
+        if curve_offset > size:
+            return false
+        let read = read_curve(data[(usize)curve_offset..], (u64)(size - curve_offset)) else return false
+        curves[i] = read.curve
+        if read.size > 4294967295 - 3:
+            return false
+        let curve_bytes = (read.size + 3) & ~(u32)3
+        let new_offset_64 = (u64)curve_offset + (u64)curve_bytes
+        if new_offset_64 > 4294967295:
+            return false
+        curve_offset = (u32)new_offset_64
+    return true
+
+# Offsets in the mAB/mBA layout: type, reserved, input channels, output channels, reserved,
+# then the B curve, matrix, M curve, CLUT and A curve offsets.
+let mab_input_channels: usize = 8
+let mab_output_channels: usize = 9
+let mab_b_curve_offset: u64 = 12
+let mab_matrix_offset: u64 = 16
+let mab_m_curve_offset: u64 = 20
+let mab_clut_offset: u64 = 24
+let mab_a_curve_offset: u64 = 28
+let mab_layout_size: u64 = 32
+## The CLUT header: sixteen grid point counts, the entry width, reserved.
+let clut_fixed_size: u64 = 20
+
+## The matrix of an mAB or mBA tag: a row-major 3x3 followed by the fourth column, times
+## `encoding_factor`.
+func read_lut_matrix(data: const u8[], at: u64, encoding_factor: f32) -> Matrix3x4:
+    var m = Matrix3x4(vals = [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
+    for r in 0..<(usize)3:
+        for c in 0..<(usize)3:
+            m.vals[r][c] = encoding_factor * read_big_fixed(data, at + (u64)(r * 3 + c) * 4)
+    for r in 0..<(usize)3:
+        m.vals[r][3] = encoding_factor * read_big_fixed(data, at + 36 + (u64)r * 4)
+    return m
+
+## The grid of a CLUT at `clut_offset` with `input_channels` axes and `output_channels`
+## values a point: its grid points, and its 8-bit or 16-bit entries.
+struct Clut:
+    var grid_points: u8[4]
+    var grid_8: const u8[]
+    var grid_16: const u8[]
+
+func read_clut(tag: const Tag*, clut_offset: u32, input_channels: u32, output_channels: u32) -> Clut?:
+    if (u64)tag.size < (u64)clut_offset + clut_fixed_size:
+        return none
+    let at = (usize)clut_offset
+    let byte_width = tag.data[at + 16]
+    if byte_width != 1 and byte_width != 2:
+        return none
+    var found = Clut()
+    var grid_size = (u64)output_channels * (u64)byte_width  # the payload
+    for i in 0..<(usize)input_channels:
+        found.grid_points[i] = tag.data[at + i]
+        # The grid only makes sense with at least two points along each axis.
+        if found.grid_points[i] < 2:
+            return none
+        grid_size *= (u64)found.grid_points[i]
+    if (u64)tag.size < (u64)clut_offset + clut_fixed_size + grid_size:
+        return none
+    let start = at + (usize)clut_fixed_size
+    let grid = tag.data[start..<start + (usize)grid_size]
+    if byte_width == 1:
+        found.grid_8 = grid
+    else:
+        found.grid_16 = grid
+    return found
+
+## read_tag_mab: an mAB tag as an A2B.
+func read_tag_mab(tag: const Tag*, a2b: A2B*, pcs_is_xyz: bool) -> bool:
+    if (u64)tag.size < mab_layout_size:
+        return false
+    a2b.input_channels = (u32)tag.data[mab_input_channels]
+    a2b.output_channels = (u32)tag.data[mab_output_channels]
+
+    # We require exactly three (ie XYZ/Lab/RGB) output channels.
+    if a2b.output_channels != 3:
+        return false
+    # We require no more than four (ie CMYK) input channels.
+    if a2b.input_channels > 4:
+        return false
+
+    let b_curve_offset = read_big_u32(tag.data, mab_b_curve_offset)
+    let matrix_offset = read_big_u32(tag.data, mab_matrix_offset)
+    let m_curve_offset = read_big_u32(tag.data, mab_m_curve_offset)
+    let clut_offset = read_big_u32(tag.data, mab_clut_offset)
+    let a_curve_offset = read_big_u32(tag.data, mab_a_curve_offset)
+
+    # "B" curves must be present.
+    if b_curve_offset == 0:
+        return false
+    if not read_curves(tag.data, tag.size, b_curve_offset, a2b.output_curves[..<(usize)a2b.output_channels]):
+        return false
+
+    # "M" curves and Matrix must be used together.
+    if m_curve_offset != 0:
+        if matrix_offset == 0:
+            return false
+        a2b.matrix_channels = a2b.output_channels
+        if not read_curves(tag.data, tag.size, m_curve_offset, a2b.matrix_curves[..<(usize)a2b.matrix_channels]):
+            return false
+        # Read matrix, which is stored as a row-major 3x3, followed by the fourth column.
+        if (u64)tag.size < (u64)matrix_offset + 48:
+            return false
+        let encoding_factor: f32 = 65535.0 / 32768.0 if pcs_is_xyz else 1.0
+        a2b.matrix = read_lut_matrix(tag.data, (u64)matrix_offset, encoding_factor)
+    else:
+        if matrix_offset != 0:
+            return false
+        a2b.matrix_channels = 0
+
+    # "A" curves and CLUT must be used together.
+    if a_curve_offset != 0:
+        if clut_offset == 0:
+            return false
+        if not read_curves(tag.data, tag.size, a_curve_offset, a2b.input_curves[..<(usize)a2b.input_channels]):
+            return false
+        let lut = read_clut(tag, clut_offset, a2b.input_channels, a2b.output_channels) else return false
+        a2b.grid_points = lut.grid_points
+        a2b.grid_8 = lut.grid_8
+        a2b.grid_16 = lut.grid_16
+    else:
+        if clut_offset != 0:
+            return false
+        # If there is no CLUT, the number of input and output channels must match.
+        if a2b.input_channels != a2b.output_channels:
+            return false
+        # Zero out the number of input channels to signal that we're skipping this stage.
+        a2b.input_channels = 0
+    return true
+
+## read_tag_mba: an mBA tag as a B2A, read_tag_mab with the stages in the other order.
+func read_tag_mba(tag: const Tag*, b2a: B2A*, pcs_is_xyz: bool) -> bool:
+    if (u64)tag.size < mab_layout_size:
+        return false
+    b2a.input_channels = (u32)tag.data[mab_input_channels]
+    b2a.output_channels = (u32)tag.data[mab_output_channels]
+
+    # Require exactly 3 inputs (XYZ) and 3 (RGB) or 4 (CMYK) outputs.
+    if b2a.input_channels != 3:
+        return false
+    if b2a.output_channels < 3 or b2a.output_channels > 4:
+        return false
+
+    let b_curve_offset = read_big_u32(tag.data, mab_b_curve_offset)
+    let matrix_offset = read_big_u32(tag.data, mab_matrix_offset)
+    let m_curve_offset = read_big_u32(tag.data, mab_m_curve_offset)
+    let clut_offset = read_big_u32(tag.data, mab_clut_offset)
+    let a_curve_offset = read_big_u32(tag.data, mab_a_curve_offset)
+
+    if b_curve_offset == 0:
+        return false
+    # "B" curves are our inputs, not outputs.
+    if not read_curves(tag.data, tag.size, b_curve_offset, b2a.input_curves[..<(usize)b2a.input_channels]):
+        return false
+
+    if m_curve_offset != 0:
+        if matrix_offset == 0:
+            return false
+        # Matrix channels is tied to input_channels (3), not output_channels.
+        b2a.matrix_channels = b2a.input_channels
+        if not read_curves(tag.data, tag.size, m_curve_offset, b2a.matrix_curves[..<(usize)b2a.matrix_channels]):
+            return false
+        if (u64)tag.size < (u64)matrix_offset + 48:
+            return false
+        let encoding_factor: f32 = 32768.0 / 65535.0 if pcs_is_xyz else 1.0  # TODO: understand
+        b2a.matrix = read_lut_matrix(tag.data, (u64)matrix_offset, encoding_factor)
+    else:
+        if matrix_offset != 0:
+            return false
+        b2a.matrix_channels = 0
+
+    if a_curve_offset != 0:
+        if clut_offset == 0:
+            return false
+        # "A" curves are our output, not input.
+        if not read_curves(tag.data, tag.size, a_curve_offset, b2a.output_curves[..<(usize)b2a.output_channels]):
+            return false
+        let lut = read_clut(tag, clut_offset, b2a.input_channels, b2a.output_channels) else return false
+        b2a.grid_points = lut.grid_points
+        b2a.grid_8 = lut.grid_8
+        b2a.grid_16 = lut.grid_16
+    else:
+        if clut_offset != 0:
+            return false
+        if b2a.input_channels != b2a.output_channels:
+            return false
+        # Zero out *output* channels to skip this stage.
+        b2a.output_channels = 0
+    return true
+
+# mark: A2B and B2A ============================================================================
+
+## read_a2b: an A2B tag in any of its three types, its identity tables made parametric.
+func read_a2b(tag: const Tag*, pcs_is_xyz: bool) -> A2B?:
+    var a2b = A2B()
+    var ok = false
+    if tag.kind == signature_mft1 or tag.kind == signature_mft2:
+        ok = read_mft_a2b(tag, &a2b)
+    if tag.kind == signature_mab:
+        ok = read_tag_mab(tag, &a2b, pcs_is_xyz)
+    if not ok:
+        return none
+    for i in 0..<(usize)a2b.input_channels:
+        canonicalize_identity(&a2b.input_curves[i])
+    for i in 0..<(usize)a2b.matrix_channels:
+        canonicalize_identity(&a2b.matrix_curves[i])
+    for i in 0..<(usize)a2b.output_channels:
+        canonicalize_identity(&a2b.output_curves[i])
+    return a2b
+
+## read_b2a.
+func read_b2a(tag: const Tag*, pcs_is_xyz: bool) -> B2A?:
+    var b2a = B2A()
+    var ok = false
+    if tag.kind == signature_mft1 or tag.kind == signature_mft2:
+        ok = read_mft_b2a(tag, &b2a)
+    if tag.kind == signature_mba:
+        ok = read_tag_mba(tag, &b2a, pcs_is_xyz)
+    if not ok:
+        return none
+    for i in 0..<(usize)b2a.input_channels:
+        canonicalize_identity(&b2a.input_curves[i])
+    for i in 0..<(usize)b2a.matrix_channels:
+        canonicalize_identity(&b2a.matrix_curves[i])
+    for i in 0..<(usize)b2a.output_channels:
+        canonicalize_identity(&b2a.output_curves[i])
+    return b2a

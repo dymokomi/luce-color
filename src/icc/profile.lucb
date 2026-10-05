@@ -1,0 +1,191 @@
+#==============================================================================================
+#
+#   icc/profile - built-in profiles, comparing profiles, and profiles as destinations
+#
+#   DESCRIPTION:
+#       Port of skcms.cc's skcms_sRGB_profile, skcms_XYZD50_profile, skcms_Init,
+#       skcms_SetTransferFunction, skcms_SetXYZD50, skcms_ApproximatelyEqualProfiles (both
+#       profiles transform skcms's 252 random bytes to XYZ D50, which may then differ by one
+#       in a byte), skcms_TRCs_AreApproximateInverse, skcms_MakeUsableAsDestination and
+#       skcms_MakeUsableAsDestinationWithSingleCurve.
+#
+#==============================================================================================
+
+# mark: Built-in profiles ======================================================================
+
+## sRGB's matrix to XYZ D50 as skcms writes it.
+pub let srgb_to_xyzd50: Matrix3x3 = Matrix3x3(vals = [[0.436065674, 0.385147095, 0.143066406], [0.222488403, 0.716873169, 0.060607910], [0.013916016, 0.097076416, 0.714096069]])
+
+extend Profile:
+    ## An empty RGB profile with an XYZ connection space (skcms_Init), to be given a
+    ## transfer function and a matrix.
+    pub static func empty() -> Profile:
+        var profile = Profile()
+        profile.data_color_space = signature_rgb
+        profile.pcs = signature_xyz
+        return profile
+
+    ## sRGB (skcms_sRGB_profile): its canonical transfer function and XYZ D50 gamut.
+    pub static func srgb() -> Profile:
+        var profile = Profile.empty()
+        profile.set_transfer_function(&srgb_transfer_function)
+        profile.set_xyzd50(&srgb_to_xyzd50)
+        return profile
+
+    ## XYZ D50 itself (skcms_XYZD50_profile): identity curves and matrix.
+    pub static func xyzd50() -> Profile:
+        var profile = Profile.empty()
+        profile.set_transfer_function(&identity_transfer_function)
+        let identity = identity_matrix()
+        profile.set_xyzd50(&identity)
+        return profile
+
+    ## All three tone curves become `tf` (skcms_SetTransferFunction).
+    pub func set_transfer_function(tf: const TransferFunction*):
+        self.has_trc = true
+        var empty: const u8[]
+        for i in 0..<(usize)3:
+            self.trc[i].table_entries = 0
+            self.trc[i].table_8 = empty
+            self.trc[i].table_16 = empty
+            self.trc[i].parametric = *tf
+
+    ## The matrix to XYZ D50 becomes `m` (skcms_SetXYZD50).
+    pub func set_xyzd50(m: const Matrix3x3*):
+        self.has_to_xyzd50 = true
+        self.to_xyzd50 = *m
+
+    ## Whether every tone curve is undone by `inv_tf` to within 1/512
+    ## (skcms_TRCs_AreApproximateInverse).
+    pub func trcs_are_approximate_inverse(inv_tf: const TransferFunction*) -> bool:
+        if not self.has_trc:
+            return false
+        return self.trc[0].are_approximate_inverses(inv_tf) and self.trc[1].are_approximate_inverses(inv_tf) and self.trc[2].are_approximate_inverses(inv_tf)
+
+    ## Makes the profile usable as a transform's destination (skcms_MakeUsableAsDestination):
+    ## a B2A lookup is, else tabulated tone curves are replaced by fitted parametric ones.
+    ## False, and the profile unchanged, when that is not possible.
+    pub func make_usable_as_destination() -> bool:
+        if not self.has_b2a:
+            if not self.has_trc or not self.has_to_xyzd50 or self.to_xyzd50.invert() == none:
+                return false
+            var tf: TransferFunction[3] = ---
+            for i in 0..<(usize)3:
+                if self.trc[i].table_entries == 0 and self.trc[i].parametric.invert() != none:
+                    tf[i] = self.trc[i].parametric
+                    continue
+                # Parametric curves from approximate() are guaranteed to be invertible.
+                let (approx, max_error) = self.trc[i].approximate() else return false
+                _ = max_error
+                tf[i] = approx
+            var empty: const u8[]
+            for i in 0..<(usize)3:
+                self.trc[i].table_entries = 0
+                self.trc[i].table_8 = empty
+                self.trc[i].table_16 = empty
+                self.trc[i].parametric = tf[i]
+        return true
+
+    ## As `make_usable_as_destination` without the B2A, then one transfer function for all
+    ## three channels: the one that best fits the other two
+    ## (skcms_MakeUsableAsDestinationWithSingleCurve).
+    pub func make_usable_as_destination_with_single_curve() -> bool:
+        var result = self
+        result.has_b2a = false
+        if not result.make_usable_as_destination():
+            return false
+
+        # Of the three, pick the transfer function that best fits the other two.
+        var best_tf: usize = 0
+        var min_max_error = infinity_
+        for i in 0..<(usize)3:
+            let inv = result.trc[i].parametric.invert() else return false
+            var err: f32 = 0.0
+            for j in 0..<(usize)3:
+                err = fmaxf_(err, self.trc[j].max_roundtrip_error(&inv))
+            if min_max_error > err:
+                min_max_error = err
+                best_tf = i
+
+        for i in 0..<(usize)3:
+            result.trc[i].parametric = result.trc[best_tf].parametric
+        self = result
+        return true
+
+# mark: Comparing profiles =====================================================================
+
+## skcms_252_random_bytes: 252 of a random shuffle of all possible bytes (divisible by 3 and
+## 4; only 192, 10, 241 and 43 are missing).
+let random_bytes_252: u8[252] = [
+    8, 179, 128, 204, 253, 38, 134, 184, 68, 102, 32, 138, 99, 39, 169, 215,
+    119, 26, 3, 223, 95, 239, 52, 132, 114, 74, 81, 234, 97, 116, 244, 205, 30,
+    154, 173, 12, 51, 159, 122, 153, 61, 226, 236, 178, 229, 55, 181, 220, 191,
+    194, 160, 126, 168, 82, 131, 18, 180, 245, 163, 22, 246, 69, 235, 252, 57,
+    108, 14, 6, 152, 240, 255, 171, 242, 20, 227, 177, 238, 96, 85, 16, 211,
+    70, 200, 149, 155, 146, 127, 145, 100, 151, 109, 19, 165, 208, 195, 164,
+    137, 254, 182, 248, 64, 201, 45, 209, 5, 147, 207, 210, 113, 162, 83, 225,
+    9, 31, 15, 231, 115, 37, 58, 53, 24, 49, 197, 56, 120, 172, 48, 21, 214,
+    129, 111, 11, 50, 187, 196, 34, 60, 103, 71, 144, 47, 203, 77, 80, 232,
+    140, 222, 250, 206, 166, 247, 139, 249, 221, 72, 106, 27, 199, 117, 54,
+    219, 135, 118, 40, 79, 41, 251, 46, 93, 212, 92, 233, 148, 28, 121, 63,
+    123, 158, 105, 59, 29, 42, 143, 23, 0, 107, 176, 87, 104, 183, 156, 193,
+    189, 90, 188, 65, 190, 17, 198, 7, 186, 161, 1, 124, 78, 125, 170, 133,
+    174, 218, 67, 157, 75, 101, 89, 217, 62, 33, 141, 228, 25, 35, 91, 230, 4,
+    2, 13, 73, 86, 167, 237, 84, 243, 44, 185, 66, 130, 110, 150, 142, 216, 88,
+    112, 36, 224, 136, 202, 76, 94, 98, 175, 213,
+]
+
+## Whether two curves are the same: their kind, parameters and tables.
+func same_curve(x: const Curve*, y: const Curve*) -> bool:
+    return x.table_entries == y.table_entries and same_transfer_function(&x.parametric, &y.parametric) and x.table_8.data == y.table_8.data and x.table_8.length == y.table_8.length and x.table_16.data == y.table_16.data and x.table_16.length == y.table_16.length
+
+## Whether two profiles hold the same values everywhere, the memcmp test that opens
+## skcms_ApproximatelyEqualProfiles.
+func identical_profiles(x: const Profile*, y: const Profile*) -> bool:
+    if x == y:
+        return true
+    if x.buffer.data != y.buffer.data or x.buffer.length != y.buffer.length or x.size != y.size or x.data_color_space != y.data_color_space or x.pcs != y.pcs or x.tag_count != y.tag_count:
+        return false
+    if x.has_trc != y.has_trc or x.has_to_xyzd50 != y.has_to_xyzd50 or x.has_a2b != y.has_a2b or x.has_b2a != y.has_b2a or x.has_cicp != y.has_cicp or x.cicp != y.cicp:
+        return false
+    for i in 0..<(usize)3:
+        if not same_curve(&x.trc[i], &y.trc[i]):
+            return false
+    if not same_matrix(&x.to_xyzd50, &y.to_xyzd50):
+        return false
+    # Lookup tables come from the buffer, which is the same: their tags were read alike.
+    return true
+
+## Whether two profiles transform skcms's 252 random bytes to XYZ D50 within one unit a
+## byte (skcms_ApproximatelyEqualProfiles). Gray and RGB profiles may match; CMYK profiles
+## match only each other.
+pub func approximately_equal_profiles(x: const Profile*, y: const Profile*) -> bool:
+    # Test for exactly equal profiles first.
+    if identical_profiles(x, y):
+        return true
+
+    # We want to allow otherwise equivalent profiles tagged as grayscale and RGB to be
+    # treated as equal. But CMYK profiles are a totally different ballgame.
+    if (x.data_color_space == signature_cmyk) != (y.data_color_space == signature_cmyk):
+        return false
+
+    # Interpret as RGB_888 if data color space is RGB or GRAY, RGBA_8888 if CMYK.
+    var format = PixelFormat.rgb_888
+    var count: usize = 84
+    if x.data_color_space == signature_cmyk:
+        format = PixelFormat.rgba_8888
+        count = 63
+
+    let xyzd50 = Profile.xyzd50()
+    var dst_x: u8[252] = ---
+    var dst_y: u8[252] = ---
+    if not transform(random_bytes_252, format, .unpremul, x, dst_x, .rgb_888, .unpremul, &xyzd50, count):
+        return false
+    if not transform(random_bytes_252, format, .unpremul, y, dst_y, .rgb_888, .unpremul, &xyzd50, count):
+        return false
+
+    for i in 0..<(usize)252:
+        let difference = (i32)dst_x[i] - (i32)dst_y[i]
+        if difference > 1 or difference < -1:
+            return false
+    return true

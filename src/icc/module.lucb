@@ -1,0 +1,291 @@
+#==============================================================================================
+#
+#   icc - ICC profiles and color transforms: a port of skcms, with Skia's color spaces on it
+#
+#   DESCRIPTION:
+#       A faithful port of skcms (Skia's ICC library, modules/skcms at the Skia that Ladybird
+#       pins): parsing ICC v2 and v4 profiles (the header, the tag table, curv and para
+#       curves, the matrix/TRC model, A2B0/B2A0 lookup tables in mft1, mft2, mAB and mBA
+#       form, the cicp tag), approximating a tabulated curve with a parametric transfer
+#       function (skcms_ApproximateCurve), the transfer function kinds (sRGB-ish, PQ-ish,
+#       HLG-ish, PQ, HLG), and skcms_Transform: pixels from one profile and pixel format into
+#       another, run op by op as skcms's portable (one lane) pipeline runs them.
+#
+#       Beside skcms are the parts of Skia that turn a profile into the color space an image
+#       is drawn in (`ColorSpace`, Skia's SkColorSpace: a transfer function and a gamut to
+#       XYZ D50, from a profile, from CICP code points (ITU-T H.273) or from named primaries
+#       and curves) and the steps that convert pixels between two of them (`Steps`, Skia's
+#       SkColorSpaceXformSteps). The bridge to this library's own `transfer`, `xyz` and
+#       `space` types is bridge.lucb.
+#
+#       skcms works in f32 and so does this port, operation for operation in skcms's order;
+#       Base does not contract `a * b + c` into a fused multiply-add, so the results are
+#       those of skcms built without contraction (-ffp-contract=off) on any machine.
+#       Half floats convert as skcms's portable path does (denormals flush to zero).
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb             the types: transfer functions, matrices, curves, the LUT
+#                               stages, profiles, pixel and alpha formats, signatures
+#       approx_math.lucb        skcms's approximate log2, exp2 and pow, scalar and pipeline
+#       transfer_function.lucb  classification, evaluation and inversion of transfer functions
+#       matrix.lucb             3x3 inversion and products, white adaptation, primaries
+#       curve.lucb              curves: evaluation, round trips, fitting a transfer function
+#       parse.lucb              the header, the tag table, curves, XYZ and cicp tags
+#       parse_lut.lucb          mft1, mft2, mAB and mBA lookup tables
+#       profile.lucb            the sRGB and XYZ profiles, comparing profiles, destinations
+#       transform.lucb          skcms_Transform: choosing the ops
+#       transform_ops.lucb      running the ops on pixels
+#       color_space.lucb        Skia's SkColorSpace and its named primaries and curves
+#       xform_steps.lucb        Skia's SkColorSpaceXformSteps
+#       bridge.lucb             `transfer.Transfer`, `xyz.Primaries`, `space.ColorSpace`
+#
+#       Copyright 2018 Google Inc. (skcms, Skia); port copyright 2026 the luce-color authors.
+#       SPDX-License-Identifier: BSD-3-Clause
+#
+#==============================================================================================
+from luce_std import math32
+
+# mark: Transfer functions =====================================================================
+
+## A transfer function, skcms_TransferFunction: `(a x + b)^g + e` for `x >= d`, `c x + f`
+## below. A negative `g` marks the HDR kinds instead (see `kind`), whose parameters reuse
+## the other fields.
+pub struct TransferFunction:
+    pub var g: f32
+    pub var a: f32
+    pub var b: f32
+    pub var c: f32
+    pub var d: f32
+    pub var e: f32
+    pub var f: f32
+
+## What a transfer function computes, skcms_TFType.
+pub enum TfType:
+    invalid
+    srgbish
+    pqish
+    hlgish
+    hlginvish
+    pq
+    hlg
+
+# mark: Matrices ===============================================================================
+
+## One row of a `Matrix3x3`.
+pub type Row3 = f32[3]
+## One row of a `Matrix3x4`.
+pub type Row4 = f32[4]
+
+## A row-major 3x3 matrix, skcms_Matrix3x3.
+pub struct Matrix3x3:
+    pub var vals: Row3[3]
+
+## A row-major 3x4 matrix (a 3x3 and an offset column), skcms_Matrix3x4.
+pub struct Matrix3x4:
+    pub var vals: Row4[3]
+
+# mark: Curves and lookup tables ===============================================================
+
+## A curve, skcms_Curve: the parametric `parametric` when `table_entries` is 0, else a table
+## of that many entries, 8-bit (`table_8`) or big-endian 16-bit (`table_16`), read from the
+## profile's bytes.
+pub struct Curve:
+    pub var table_entries: u32
+    pub var parametric: TransferFunction
+    pub var table_8: const u8[]
+    pub var table_16: const u8[]
+
+## The device-to-PCS lookup, skcms_A2B: input curves ("A"), a grid of `grid_points` per
+## input channel, matrix curves ("M") and a 3x4 matrix, output curves ("B"). A stage whose
+## channel count is 0 is skipped.
+pub struct A2B:
+    pub var input_curves: Curve[4]
+    pub var grid_8: const u8[]
+    pub var grid_16: const u8[]
+    pub var input_channels: u32
+    pub var grid_points: u8[4]
+    pub var matrix_curves: Curve[3]
+    pub var matrix: Matrix3x4
+    pub var matrix_channels: u32
+    pub var output_channels: u32
+    pub var output_curves: Curve[3]
+
+## The PCS-to-device lookup, skcms_B2A: the stages of `A2B` in the opposite order.
+pub struct B2A:
+    pub var input_curves: Curve[3]
+    pub var input_channels: u32
+    pub var matrix_channels: u32
+    pub var matrix_curves: Curve[3]
+    pub var matrix: Matrix3x4
+    pub var output_curves: Curve[4]
+    pub var grid_8: const u8[]
+    pub var grid_16: const u8[]
+    pub var grid_points: u8[4]
+    pub var output_channels: u32
+
+## Coding-independent code points (ITU-T H.273), skcms_CICP, from a profile's cicp tag.
+pub struct Cicp:
+    pub var color_primaries: u8
+    pub var transfer_characteristics: u8
+    pub var matrix_coefficients: u8
+    pub var video_full_range_flag: u8
+
+# mark: Profiles ===============================================================================
+
+## A parsed ICC profile, skcms_ICCProfile. It reads tables out of `buffer`, the profile's
+## bytes, which must outlive it.
+pub struct Profile:
+    pub var buffer: const u8[]
+    pub var size: u32
+    pub var data_color_space: u32
+    pub var pcs: u32
+    pub var tag_count: u32
+    ## The three tone curves, when `has_trc`.
+    pub var trc: Curve[3]
+    ## Linear RGB to XYZ D50, when `has_to_xyzd50`.
+    pub var to_xyzd50: Matrix3x3
+    pub var a2b: A2B
+    pub var b2a: B2A
+    pub var cicp: Cicp
+    pub var has_trc: bool
+    pub var has_to_xyzd50: bool
+    pub var has_a2b: bool
+    pub var has_b2a: bool
+    pub var has_cicp: bool
+
+## A tag of a profile, skcms_ICCTag: its signature, the type at the start of its data, and
+## its `size` bytes of data.
+pub struct Tag:
+    pub var signature: u32
+    pub var kind: u32
+    pub var size: u32
+    pub var data: const u8[]
+
+# mark: Signatures =============================================================================
+
+# The data color spaces and connection spaces of skcms_Signature.
+pub let signature_cmyk: u32 = 0x434D594B
+pub let signature_gray: u32 = 0x47524159
+pub let signature_rgb: u32 = 0x52474220
+pub let signature_lab: u32 = 0x4C616220
+pub let signature_xyz: u32 = 0x58595A20
+pub let signature_cieluv: u32 = 0x4C757620
+pub let signature_ycbcr: u32 = 0x59436272
+pub let signature_cieyxy: u32 = 0x59787920
+pub let signature_hsv: u32 = 0x48535620
+pub let signature_hls: u32 = 0x484C5320
+pub let signature_cmy: u32 = 0x434D5920
+## nCLR for n from 2 to 15 is `0x30434C52 + n` up to 9, then 0x41434C52 for 10 to 0x46434C52.
+pub let signature_2clr: u32 = 0x32434C52
+pub let signature_15clr: u32 = 0x46434C52
+
+# The file signature, tags and tag types only skcms reads.
+let signature_acsp: u32 = 0x61637370
+let signature_rtrc: u32 = 0x72545243
+let signature_gtrc: u32 = 0x67545243
+let signature_btrc: u32 = 0x62545243
+let signature_ktrc: u32 = 0x6B545243
+let signature_rxyz: u32 = 0x7258595A
+let signature_gxyz: u32 = 0x6758595A
+let signature_bxyz: u32 = 0x6258595A
+let signature_a2b0: u32 = 0x41324230
+let signature_b2a0: u32 = 0x42324130
+let signature_chad: u32 = 0x63686164
+let signature_wtpt: u32 = 0x77747074
+let signature_cicp: u32 = 0x63696370
+let signature_curv: u32 = 0x63757276
+let signature_mft1: u32 = 0x6D667431
+let signature_mft2: u32 = 0x6D667432
+let signature_mab: u32 = 0x6D414220
+let signature_mba: u32 = 0x6D424120
+let signature_para: u32 = 0x70617261
+let signature_sf32: u32 = 0x73663332
+
+# mark: Pixel formats ==========================================================================
+
+## How pixels are laid out in memory, skcms_PixelFormat. Formats come in pairs whose odd
+## member swaps red and blue; 16-bit formats name their byte order.
+pub enum PixelFormat as u8:
+    a_8 = 0
+    a_8_ = 1
+    g_8 = 2
+    g_8_ = 3
+    ga_88 = 4
+    ga_88_ = 5
+    rgb_565 = 6
+    bgr_565 = 7
+    abgr_4444 = 8
+    argb_4444 = 9
+    rgb_888 = 10
+    bgr_888 = 11
+    rgba_8888 = 12
+    bgra_8888 = 13
+    rgba_8888_srgb = 14
+    bgra_8888_srgb = 15
+    rgba_1010102 = 16
+    bgra_1010102 = 17
+    rgb_161616le = 18
+    bgr_161616le = 19
+    rgba_16161616le = 20
+    bgra_16161616le = 21
+    rgb_161616be = 22
+    bgr_161616be = 23
+    rgba_16161616be = 24
+    bgra_16161616be = 25
+    rgb_hhh_norm = 26
+    bgr_hhh_norm = 27
+    rgba_hhhh_norm = 28
+    bgra_hhhh_norm = 29
+    rgb_hhh = 30
+    bgr_hhh = 31
+    rgba_hhhh = 32
+    bgra_hhhh = 33
+    rgb_fff = 34
+    bgr_fff = 35
+    rgba_ffff = 36
+    bgra_ffff = 37
+    rgb_101010x_xr = 38
+    bgr_101010x_xr = 39
+    rgba_10101010_xr = 40
+    bgra_10101010_xr = 41
+
+## How alpha relates to color, skcms_AlphaFormat.
+pub enum AlphaFormat:
+    ## Alpha is always opaque.
+    opaque
+    ## Alpha and color are unassociated.
+    unpremul
+    ## Color is premultiplied by alpha while encoded.
+    premul_as_encoded
+
+# mark: Helpers ================================================================================
+
+## The zero matrix.
+func zero_matrix() -> Matrix3x3:
+    return Matrix3x3(vals = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+
+## The identity.
+pub func identity_matrix() -> Matrix3x3:
+    return Matrix3x3(vals = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+
+## Whether two transfer functions hold the same bits (skcms and Skia compare them with memcmp).
+pub func same_transfer_function(x: const TransferFunction*, y: const TransferFunction*) -> bool:
+    return x.g.bits() == y.g.bits() and x.a.bits() == y.a.bits() and x.b.bits() == y.b.bits() and x.c.bits() == y.c.bits() and x.d.bits() == y.d.bits() and x.e.bits() == y.e.bits() and x.f.bits() == y.f.bits()
+
+## Whether two matrices hold the same bits.
+pub func same_matrix(x: const Matrix3x3*, y: const Matrix3x3*) -> bool:
+    for r in 0..<(usize)3:
+        for c in 0..<(usize)3:
+            if x.vals[r][c].bits() != y.vals[r][c].bits():
+                return false
+    return true
+
+## Whether a 3x4 matrix holds the bits of the identity.
+func is_identity_3x4(m: const Matrix3x4*) -> bool:
+    for r in 0..<(usize)3:
+        for c in 0..<(usize)4:
+            let one: f32 = 1.0 if r == c else 0.0
+            if m.vals[r][c].bits() != one.bits():
+                return false
+    return true
