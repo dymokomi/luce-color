@@ -2,6 +2,7 @@
 """luce-color's gate, in native and C comparison modes:
 
 - every module's own test blocks (the icc module's with its tests/icc fragments);
+- the ACES 2.0 output transforms (src/aces) against OpenColorIO's (tests/fixtures/aces);
 - the icc oracle driver (tests/icc_tool.lucb) on every profile of tests/fixtures/icc gives
   skcms's dump (expected.txt) and Skia's color spaces (spaces.txt) byte for byte, and its
   pixel-format sweeps hash as skcms's (formats.sha256).
@@ -32,6 +33,7 @@ for name in ["color", "transfer", "xyz", "lab", "cam16", "hsl", "space", "oklab"
         run([base, "test", ROOT / f"src/{name}.lucb", *flags])
 for flags in MODES:
     run([base, "test", ROOT / "src/icc", *flags])
+    run([base, "test", ROOT / "src/aces", *flags])
 
 profiles = sorted(p.name for p in FIXTURES.glob("*.icc"))
 expected = (FIXTURES / "expected.txt").read_bytes()
@@ -51,4 +53,10 @@ with tempfile.TemporaryDirectory() as tmp:
             sweep = subprocess.run([tool, "--formats", profile], check=True, cwd=FIXTURES, capture_output=True, timeout=300).stdout
             if hashlib.sha256(sweep).hexdigest() != digest:
                 raise SystemExit(f"FAIL icc_tool {flags[0]} --formats {profile}: the pixels differ from skcms's")
-print("PASS luce-color color science: Oklab, transfer curves, XYZ, Lab, CAM16, HSL, spaces and ICC (skcms's dumps and Skia's color spaces to the bit), native and comparison modes")
+# ACES 2.0 against OpenColorIO's builtin output transforms (tests/make_aces_fixtures.py).
+with tempfile.TemporaryDirectory() as tmp:
+    for flags in MODES:
+        tool = Path(tmp) / f"aces_check{flags[0].replace('-', '_').replace('=', '_')}"
+        run([base, "build", ROOT / "tests/aces_check.lucb", *flags, "-o", tool])
+        run([tool, ROOT / "tests/fixtures/aces/reference.txt"])
+print("PASS luce-color color science: Oklab, transfer curves, XYZ, Lab, CAM16, HSL, spaces, ACES 2.0 (OpenColorIO's within 1e-4) and ICC (skcms's dumps and Skia's color spaces to the bit), native and comparison modes")

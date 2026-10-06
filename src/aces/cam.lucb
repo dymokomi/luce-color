@@ -1,0 +1,128 @@
+#==============================================================================================
+#
+#   aces/cam - Hellwig 2022 JMh with the ACES 2.0 modifications
+#
+#   DESCRIPTION:
+#       The color appearance model the output transform works in: CAM16 cone space
+#       (with its "stretched" ACES primaries), full adaptation to the RGB space's own
+#       white, a dim surround at 100 cd/m² adapting luminance, the post-adaptation
+#       compression without CAM16's noise term, and J, M and h (in degrees) from the
+#       achromatic A and the opponent a, b. A space's model is a `Cam`: its matrices
+#       folded with the adaptation, and the constants of J.
+#
+#==============================================================================================
+
+## The reference luminance and the viewing conditions (dim surround).
+let reference_luminance: f64 = 100.0
+let adapting_luminance: f64 = 100.0
+let background_luminance: f64 = 20.0
+let surround_c: f64 = 0.59
+let surround_n: f64 = 0.9
+let j_scale: f64 = 100.0
+let compression_offset: f64 = 27.13
+let compression_scale: f64 = 400.0
+
+## The cone space's primaries: CAM16's matrix as a set of chromaticities.
+let cam16_primaries: xyz.Primaries = xyz.Primaries(xyz.Chromaticity(0.8336, 0.1735), xyz.Chromaticity(2.3854, -1.4659),
+                                                   xyz.Chromaticity(0.087, -0.125), xyz.Chromaticity(0.333, 0.333))
+
+## The model for one RGB space.
+struct Cam:
+    var to_cone: f64[9]
+    var from_cone: f64[9]
+    var to_aab: f64[9]
+    var from_aab: f64[9]
+    var f_l_n: f64
+    var cz: f64
+    var a_w_j: f64
+
+## The c·z nonlinearity of J.
+func model_gamma() -> f64:
+    return surround_c * (1.48 + math.sqrt(background_luminance / reference_luminance))
+
+## The post-adaptation compression of a non-negative cone response, and back.
+func compress_cone(value: f64) -> f64:
+    let f = math.pow(value, 0.42)
+    return f / (compression_offset + f)
+
+func expand_cone(value: f64) -> f64:
+    let limited = math.min(value, 0.99)
+    return math.pow(compression_offset * limited / (1.0 - limited), 1.0 / 0.42)
+
+func compress_signed(value: f64) -> f64:
+    return math.copysign(compress_cone(math.abs(value)), value)
+
+func expand_signed(value: f64) -> f64:
+    return math.copysign(expand_cone(math.abs(value)), value)
+
+## The model of the RGB space with `primaries`.
+func cam_of(primaries: xyz.Primaries) -> Cam:
+    let base: f64[9] = [2.0, 1.0, 1.0 / 20.0, 1.0, -12.0 / 11.0, 1.0 / 11.0, 1.0 / 9.0, 1.0 / 9.0, -2.0 / 9.0]
+    let cone_of_xyz = from_xyz_of(cam16_primaries)
+    let white_xyz = times(to_xyz_of(primaries), [reference_luminance, reference_luminance, reference_luminance])
+    let white_cone = times(cone_of_xyz, white_xyz)
+    let k = 1.0 / (5.0 * adapting_luminance + 1.0)
+    let k4 = k * k * k * k
+    let f_l = 0.2 * k4 * (5.0 * adapting_luminance) + 0.1 * (1.0 - k4) * (1.0 - k4) * math.cbrt(5.0 * adapting_luminance)
+    let f_l_n = f_l / reference_luminance
+    # Full adaptation to the space's white, folded into the matrix.
+    let d: f64[3] = [f_l_n * white_xyz[1] / white_cone[0], f_l_n * white_xyz[1] / white_cone[1], f_l_n * white_xyz[1] / white_cone[2]]
+    let adapted: f64[3] = [compress_signed(d[0] * white_cone[0]), compress_signed(d[1] * white_cone[1]), compress_signed(d[2] * white_cone[2])]
+    var to_aab: f64[9]
+    for at in 0..<(usize)9:
+        to_aab[at] = base[at] * compression_scale
+    let a_w = to_aab[0] * adapted[0] + to_aab[1] * adapted[1] + to_aab[2] * adapted[2]
+    for at in 0..<(usize)3:
+        to_aab[at] /= a_w
+    for at in 3..<(usize)9:
+        to_aab[at] *= 43.0 * surround_n
+    let to_cone = product(diagonal(d), product(rgb_to_rgb(primaries, cam16_primaries), diagonal([reference_luminance, reference_luminance, reference_luminance])))
+    return Cam(to_cone = to_cone, from_cone = inverse(to_cone), to_aab = to_aab, from_aab = inverse(to_aab),
+               f_l_n = f_l_n, cz = model_gamma(), a_w_j = compress_cone(f_l))
+
+## RGB to the achromatic and opponent values A, a, b.
+func rgb_to_aab(rgb: f64[3], cam: const Cam*) -> f64[3]:
+    let cone = times(cam.to_cone, rgb)
+    return times(cam.to_aab, [compress_signed(cone[0]), compress_signed(cone[1]), compress_signed(cone[2])])
+
+func aab_to_rgb(aab: f64[3], cam: const Cam*) -> f64[3]:
+    let compressed = times(cam.from_aab, aab)
+    return times(cam.from_cone, [expand_signed(compressed[0]), expand_signed(compressed[1]), expand_signed(compressed[2])])
+
+func a_to_j(a: f64, cam: const Cam*) -> f64:
+    return j_scale * math.pow(a, cam.cz)
+
+func j_to_a(j: f64, cam: const Cam*) -> f64:
+    return math.pow(j / j_scale, 1.0 / cam.cz)
+
+## A hue in degrees, in 0..360.
+func wrap_hue(degrees: f64) -> f64:
+    let wrapped = math.mod(degrees, 360.0)
+    return wrapped + 360.0 if wrapped < 0.0 else wrapped
+
+func aab_to_jmh(aab: f64[3], cam: const Cam*) -> f64[3]:
+    if aab[0] <= 0.0:
+        return [0.0, 0.0, 0.0]
+    let hue = math.atan2(aab[2], aab[1]) * 180.0 / math.pi
+    return [a_to_j(aab[0], cam), math.sqrt(aab[1] * aab[1] + aab[2] * aab[2]), hue + 360.0 if hue < 0.0 else hue]
+
+func rgb_to_jmh(rgb: f64[3], cam: const Cam*) -> f64[3]:
+    return aab_to_jmh(rgb_to_aab(rgb, cam), cam)
+
+func jmh_to_aab(jmh: f64[3], cos_h: f64, sin_h: f64, cam: const Cam*) -> f64[3]:
+    return [j_to_a(jmh[0], cam), jmh[1] * cos_h, jmh[1] * sin_h]
+
+func jmh_to_rgb(jmh: f64[3], cam: const Cam*) -> f64[3]:
+    let radians = jmh[2] * math.pi / 180.0
+    return aab_to_rgb(jmh_to_aab(jmh, math.cos(radians), math.sin(radians), cam), cam)
+
+## The luminance of an achromatic A (Y = 100 at the space's white), and J of a luminance.
+func a_to_y(a: f64, cam: const Cam*) -> f64:
+    return expand_cone(cam.a_w_j * a) / cam.f_l_n
+
+func j_to_y(j: f64, cam: const Cam*) -> f64:
+    return a_to_y(j_to_a(math.abs(j), cam), cam)
+
+func y_to_j(y: f64, cam: const Cam*) -> f64:
+    let compressed = compress_cone(math.abs(y) * cam.f_l_n)
+    return math.copysign(a_to_j(compressed / cam.a_w_j, cam), y)

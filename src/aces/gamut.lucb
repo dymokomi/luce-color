@@ -1,0 +1,186 @@
+#==============================================================================================
+#
+#   aces/gamut - The gamut compression
+#
+#   DESCRIPTION:
+#       Colors the tonescale and chroma compression left outside the limiting gamut move
+#       toward a focus point on the J axis, along a line whose slope depends on where the
+#       color sits relative to the hue's cusp. The gamut's boundary on that line is
+#       estimated from the cusp, a fixed lower-hull gamma and the upper-hull gamma fitted
+#       per hue (fit_upper_hull); M past a threshold is remapped with a Reinhard curve so
+#       the reach gamut's boundary lands on the limiting gamut's.
+#
+#==============================================================================================
+
+let smooth_cusps: f64 = 0.12
+let smooth_m: f64 = 0.27
+let cusp_mid_blend: f64 = 1.3
+let focus_gain_blend: f64 = 0.3
+let focus_distance: f64 = 1.35
+let focus_distance_scaling: f64 = 1.75
+let compression_threshold: f64 = 0.75
+
+## The gamut compression's constants and tables for one transform.
+struct Gamut:
+    var mid_j: f64
+    var focus_distance: f64
+    var lower_gamma_inv: f64
+    var search: i64[2]
+    var hues: f64[363]
+    ## Per entry: the cusp's J and M, then the upper hull's inverse gamma.
+    var cusps: f64[1089]
+
+## What the compression of one hue needs.
+struct HueGamut:
+    var cusp_j: f64
+    var cusp_m: f64
+    var gamma_top_inv: f64
+    var gamma_bottom_inv: f64
+    var focus_j: f64
+    var threshold: f64
+
+## The upper index of the hue table's interval holding `hue`.
+func hue_interval(hue: f64, gamut: const Gamut*) -> usize:
+    var at = (i64)first_entry + (i64)hue
+    var low = at + gamut.search[0]
+    var high = at + gamut.search[1]
+    low = low if low > 0 else 0
+    high = high if high < (i64)upper_wrap else (i64)upper_wrap
+    while low + 1 < high:
+        if hue > gamut.hues[(usize)at]:
+            low = at
+        else:
+            high = at
+        at = (low + high) // 2
+    return (usize)(high if high > 1 else 1)
+
+func focus_j_of(cusp_j: f64, mid_j: f64, limit_j: f64) -> f64:
+    return lerp(cusp_j, mid_j, math.min(1.0, cusp_mid_blend - cusp_j / limit_j))
+
+func hue_gamut(hue: f64, limit_j: f64, gamut: const Gamut*) -> HueGamut:
+    let high = hue_interval(hue, gamut)
+    let t = (hue - gamut.hues[high - 1]) / (gamut.hues[high] - gamut.hues[high - 1])
+    let cusp_j = lerp(gamut.cusps[(high - 1) * 3], gamut.cusps[high * 3], t)
+    let cusp_m = lerp(gamut.cusps[(high - 1) * 3 + 1], gamut.cusps[high * 3 + 1], t)
+    let gamma = lerp(gamut.cusps[(high - 1) * 3 + 2], gamut.cusps[high * 3 + 2], t)
+    return HueGamut(cusp_j = cusp_j, cusp_m = cusp_m, gamma_top_inv = gamma, gamma_bottom_inv = gamut.lower_gamma_inv,
+                    focus_j = focus_j_of(cusp_j, gamut.mid_j, limit_j), threshold = lerp(cusp_j, limit_j, focus_gain_blend))
+
+func focus_gain(j: f64, threshold: f64, limit_j: f64, distance: f64) -> f64:
+    var gain = limit_j * distance
+    if j > threshold:
+        let adjustment = math.log10((limit_j - threshold) / math.max(0.0001, limit_j - j))
+        gain = gain * (adjustment * adjustment + 1.0)
+    return gain
+
+## Where the compression line through (J, M) meets the J axis.
+func j_intersect(j: f64, m: f64, focus_j: f64, max_j: f64, slope_gain: f64) -> f64:
+    let m_scaled = m / slope_gain
+    let a = m_scaled / focus_j
+    if j < focus_j:
+        let b = 1.0 - m_scaled
+        let c = -j
+        return -2.0 * c / (b + math.sqrt(b * b - 4.0 * a * c))
+    let b = -(1.0 + m_scaled + max_j * a)
+    let c = max_j * m_scaled + j
+    return -2.0 * c / (b - math.sqrt(b * b - 4.0 * a * c))
+
+func vector_slope(intersect: f64, focus_j: f64, limit_j: f64, slope_gain: f64) -> f64:
+    let scaler = intersect if intersect < focus_j else limit_j - intersect
+    return scaler * (intersect - focus_j) / (focus_j * slope_gain)
+
+## M where the line from `intersect` with `slope` meets the hull J = J_max·(M/M_max)^γ,
+## approximated through a shifted intersection.
+func line_hull_m(intersect: f64, slope: f64, gamma_inv: f64, j_max: f64, m_max: f64, reference: f64) -> f64:
+    let shifted = reference * math.pow(intersect / reference, gamma_inv)
+    return shifted * m_max / (j_max - slope * m_max)
+
+func smooth_min(a: f64, b: f64, scale: f64) -> f64:
+    let s = smooth_cusps * scale
+    let h = math.max(s - math.abs(a - b), 0.0) / s
+    return math.min(a, b) - h * h * h * s / 6.0
+
+func boundary_m(cusp_j: f64, cusp_m: f64, j_max: f64, gamma_top_inv: f64, gamma_bottom_inv: f64, intersect: f64, slope: f64, intersect_cusp: f64) -> f64:
+    let lower = line_hull_m(intersect, slope, gamma_bottom_inv, cusp_j, cusp_m, intersect_cusp)
+    let upper = line_hull_m(j_max - intersect, -slope, gamma_top_inv, j_max - cusp_j, cusp_m, j_max - intersect_cusp)
+    return smooth_min(lower, upper, cusp_m)
+
+func remap_m(m: f64, gamut_m: f64, reach_m: f64) -> f64:
+    let proportion = math.max(gamut_m / reach_m, compression_threshold)
+    let threshold = proportion * gamut_m
+    if m <= threshold or proportion >= 1.0:
+        return m
+    let gamut_offset = gamut_m - threshold
+    let reach_offset = reach_m - threshold
+    let scale = reach_offset / ((reach_offset / gamut_offset) - 1.0)
+    let nd = (m - threshold) / scale
+    return threshold + scale * nd / (1.0 + nd)
+
+func compress(jmh: f64[3], limit_j: f64, gamma_inv: f64, reach_m: f64, gamut: const Gamut*, hue: const HueGamut*) -> f64[3]:
+    let gain = focus_gain(jmh[0], hue.threshold, limit_j, gamut.focus_distance)
+    let intersect = j_intersect(jmh[0], jmh[1], hue.focus_j, limit_j, gain)
+    let slope = vector_slope(intersect, hue.focus_j, limit_j, gain)
+    let intersect_cusp = j_intersect(hue.cusp_j, hue.cusp_m, hue.focus_j, limit_j, gain)
+    let gamut_m = boundary_m(hue.cusp_j, hue.cusp_m, limit_j, hue.gamma_top_inv, hue.gamma_bottom_inv, intersect, slope, intersect_cusp)
+    if gamut_m <= 0.0:
+        return [jmh[0], 0.0, jmh[2]]
+    let reach_boundary = line_hull_m(intersect, slope, gamma_inv, limit_j, reach_m, limit_j)
+    let remapped = remap_m(jmh[1], gamut_m, reach_boundary)
+    return [intersect + remapped * slope, remapped, jmh[2]]
+
+func gamut_compress(jmh: f64[3], limit_j: f64, gamma_inv: f64, reach_m: f64, gamut: const Gamut*) -> f64[3]:
+    if jmh[0] <= 0.0:
+        return [0.0, 0.0, jmh[2]]
+    if jmh[1] <= 0.0 or jmh[0] > limit_j:
+        return [jmh[0], 0.0, jmh[2]]
+    let hue = hue_gamut(jmh[2], limit_j, gamut)
+    return compress(jmh, limit_j, gamma_inv, reach_m, gamut, &hue)
+
+## Fit each hue's upper-hull gamma: the smallest that puts the boundary estimate outside
+## the limiting gamut at five test lightnesses between the cusp and the peak.
+func fit_upper_hull(gamut: Gamut*, peak: f64, limit_j: f64, limiting: const Cam*):
+    let positions: f64[5] = [0.01, 0.1, 0.5, 0.8, 0.99]
+    let roof = peak / reference_luminance
+    for at in first_entry..<upper_wrap:
+        let hue = gamut.hues[at]
+        let cusp_j = gamut.cusps[at * 3]
+        let cusp_m = gamut.cusps[at * 3 + 1]
+        let threshold = lerp(cusp_j, limit_j, focus_gain_blend)
+        let focus_j = focus_j_of(cusp_j, gamut.mid_j, limit_j)
+        var tests: f64[20]
+        for t in 0..<(usize)5:
+            let test_j = lerp(cusp_j, limit_j, positions[t])
+            let gain = focus_gain(test_j, threshold, limit_j, gamut.focus_distance)
+            let intersect = j_intersect(test_j, cusp_m, focus_j, limit_j, gain)
+            tests[t * 4] = intersect
+            tests[t * 4 + 1] = vector_slope(intersect, focus_j, limit_j, gain)
+            tests[t * 4 + 2] = j_intersect(cusp_j, cusp_m, focus_j, limit_j, gain)
+        var low = 0.0
+        var high = 0.4
+        var found = false
+        while not found and high < 5.0:
+            if fits(&tests, 1.0 / high, hue, cusp_j, cusp_m, limit_j, gamut.lower_gamma_inv, roof, limiting):
+                found = true
+            else:
+                low = high
+                high += 0.4
+        while high - low > 1.0e-5:
+            let middle = (high + low) / 2.0
+            if fits(&tests, 1.0 / middle, hue, cusp_j, cusp_m, limit_j, gamut.lower_gamma_inv, roof, limiting):
+                high = middle
+            else:
+                low = middle
+        gamut.cusps[at * 3 + 2] = 1.0 / high
+    gamut.cusps[2] = gamut.cusps[360 * 3 + 2]
+    gamut.cusps[upper_wrap * 3 + 2] = gamut.cusps[first_entry * 3 + 2]
+    gamut.cusps[(upper_wrap + 1) * 3 + 2] = gamut.cusps[(first_entry + 1) * 3 + 2]
+
+func fits(tests: const f64[20]*, gamma_top_inv: f64, hue: f64, cusp_j: f64, cusp_m: f64, limit_j: f64, gamma_bottom_inv: f64, roof: f64, limiting: const Cam*) -> bool:
+    for t in 0..<(usize)5:
+        let intersect = (*tests)[t * 4]
+        let slope = (*tests)[t * 4 + 1]
+        let m = boundary_m(cusp_j, cusp_m, limit_j, gamma_top_inv, gamma_bottom_inv, intersect, slope, (*tests)[t * 4 + 2])
+        let rgb = jmh_to_rgb([intersect + slope * m, m, hue], limiting)
+        if not (rgb[0] > roof or rgb[1] > roof or rgb[2] > roof):
+            return false
+    return true

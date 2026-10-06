@@ -14,6 +14,7 @@ UI theme and a file codec agree about what a color is:
 | `oklab` | Oklab from XYZ, ΔEok, sRGB `max_chroma(l, h)`, CSS-style gamut mapping by chroma reduction (`to_srgb`), gamut-relative chroma for pickers |
 | `hsl` | HSV (Photoshop's HSB) and HSL over encoded RGB, for pickers |
 | `space` | `ColorSpace` = name + primaries + transfer, as OpenColorIO models one; a catalogue (`space.all`, `space.named`); `convert(color, from, to)` — decode, matrix, adapt, matrix, encode — plus `to_lab`, `to_oklab_in`, `to_appearance`, `in_gamut`, `clamp` |
+| `aces` | the ACES 2.0 Output Transform: Hellwig 2022 JMh, the Daniele tonescale, chroma compression and gamut compression into a display's limiting gamut, for SDR and HDR peaks; matches OpenColorIO's builtin transforms within 1e-4 of the peak |
 | `icc` | ICC profiles, a port of skcms (Skia's ICC library): `parse` (v2 and v4, matrix/TRC, A2B/B2A lookup tables, cicp), transfer functions and curve fitting, `transform` between profiles and pixel formats; Skia's `ColorSpace` (from a profile, CICP code points or named primaries and curves) and the `Steps` between two of them |
 
 ```luce
@@ -37,6 +38,27 @@ Numbers are checked against the published references in each module's tests:
 the sRGB matrix, ST 2084's luminance anchors, Sharma's CIEDE2000 pairs, CAM16's
 white and inverse. An OCIO config reader is not here yet; `space.convert` is the
 processor chain one would produce for a pair of its color spaces.
+
+## ACES 2.0 (`aces`)
+
+```luce
+from luce_color import aces, xyz
+
+# SDR: a 100-nit display limited to Rec.709/sRGB primaries.
+let sdr = try aces.OutputTransform.create(100.0, xyz.srgb)
+let shown = sdr.apply_ap1([0.18, 0.18, 0.18])   # ACEScg in; display-linear sRGB-primary RGB out, ~0.1
+```
+
+`OutputTransform.create(peak_nits, limiting)` builds the transform's hue tables once,
+in a few milliseconds. `apply(ap0)` and `apply_ap1(ap1)` give display-linear RGB in
+the limiting primaries, where 1.0 is 100 cd/m² (an SDR display's white is 1.0, a
+1000-nit display's is 10.0), clamped to the peak. `to_xyz()` converts that RGB to
+CIE XYZ. Encoding for the display is the caller's job, through `space` and
+`transfer`. The transform follows the Academy's aces-output and OpenColorIO's ACES2
+implementation (reference only), in f64. `tests/aces_check.lucb` compares it with
+OpenColorIO 2.6's builtins (SDR Rec.709, SDR P3-D65, 1000-nit P3-D65 and Rec.2020)
+on 447 colors each. The largest difference is 1.5e-5 of the peak.
+`tests/make_aces_fixtures.py` regenerates the reference from OpenColorIO.
 
 ## ICC profiles (`icc`)
 

@@ -6,7 +6,7 @@ def package "luce-color" {
     str language = "luce-base"
     str description = "Color science in Luce Base: XYZ and Bradford adaptation, sRGB/P3/Adobe/Rec.2020/ACES/ProPhoto, sRGB/gamma/PQ/HLG curves, CIELAB/CIEDE2000, Oklab, CAM16, HSV/HSL, OCIO-style conversion, ICC profiles and transforms (skcms port)."
     str readme = "README.md"
-    str[] public = ["cam16", "color", "hsl", "icc", "lab", "oklab", "space", "transfer", "xyz"]
+    str[] public = ["aces", "cam16", "color", "hsl", "icc", "lab", "oklab", "space", "transfer", "xyz"]
 
     def dependency "luce-std" {
         str owner = "dymokomi"

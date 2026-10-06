@@ -1,0 +1,250 @@
+#==============================================================================================
+#
+#   aces/tables - The hue tables the gamut compression reads
+#
+#   DESCRIPTION:
+#       Built once per transform. Every table has 360 nominal entries at indices 1..360
+#       with one wrapped entry before and two after, so lookups need no wrapping:
+#
+#       - the reach table: the largest M at the peak's J that stays inside AP1, per degree;
+#       - the hue table: 360 hues spaced as evenly as possible while landing exactly on
+#         the hues of the limiting gamut's and the reach gamut's six cube corners;
+#       - the cusp table: per hue of the hue table, the limiting gamut's cusp (the
+#         brightest J and largest M on its surface), then the gamma of the upper hull
+#         that best keeps compressed colors inside the limiting gamut.
+#
+#==============================================================================================
+
+let table_size: usize = 363
+let first_entry: usize = 1
+let upper_wrap: usize = 361
+
+## The unit cube's corner `corner` of R, Y, G, C, B, M (hues in order), as RGB.
+func cube_corner(corner: usize) -> f64[3]:
+    return [1.0 if (corner + 1) % 6 < 3 else 0.0, 1.0 if (corner + 5) % 6 < 3 else 0.0, 1.0 if (corner + 3) % 6 < 3 else 0.0]
+
+func any_negative(rgb: f64[3]) -> bool:
+    return rgb[0] < 0.0 or rgb[1] < 0.0 or rgb[2] < 0.0
+
+## The reach table for `reach` (AP1) at J `limit_j`.
+func fill_reach_table(table: f64[363], reach: const Cam*, limit_j: f64) -> f64[363]:
+    var out = table
+    for at in 0..<(usize)360:
+        let hue = (f64)at
+        var low = 0.0
+        var high = 50.0
+        var outside = false
+        while not outside and high < 1300.0:
+            outside = any_negative(jmh_to_rgb([limit_j, high, hue], reach))
+            if not outside:
+                low = high
+                high += 50.0
+        while high - low > 1.0e-2:
+            let sample = (high + low) / 2.0
+            if any_negative(jmh_to_rgb([limit_j, sample, hue], reach)):
+                high = sample
+            else:
+                low = sample
+        out[at + first_entry] = high
+    out[0] = out[360]
+    out[upper_wrap] = out[first_entry]
+    out[upper_wrap + 1] = out[first_entry + 1]
+    return out
+
+## The reach M for hue `hue` (degrees), interpolated.
+func reach_at(table: const f64[363]*, hue: f64) -> f64:
+    let base = (usize)hue
+    let t = hue - (f64)base
+    return lerp((*table)[base + first_entry], (*table)[base + first_entry + 1], t)
+
+## Eight corners: the six in hue order from the lowest hue at 1, wrapped copies at 0 and 7.
+struct Corners:
+    var rgb: f64[24]
+    var jmh: f64[24]
+
+    func hue(at: usize) -> f64:
+        return self.jmh[at * 3 + 2]
+
+    func rgb_at(at: usize) -> f64[3]:
+        return [self.rgb[at * 3], self.rgb[at * 3 + 1], self.rgb[at * 3 + 2]]
+
+    func put(at: usize, rgb: f64[3], jmh: f64[3]):
+        for c in 0..<(usize)3:
+            self.rgb[at * 3 + c] = rgb[c]
+            self.jmh[at * 3 + c] = jmh[c]
+
+## Order six corners by hue from the lowest, and wrap.
+func arrange(rgbs: f64[18], jmhs: f64[18]) -> Corners:
+    var lowest: usize = 0
+    for at in 0..<(usize)6:
+        if jmhs[at * 3 + 2] < jmhs[lowest * 3 + 2]:
+            lowest = at
+    var out: Corners
+    for at in 0..<(usize)6:
+        let from_at = (at + lowest) % 6
+        out.put(at + 1, [rgbs[from_at * 3], rgbs[from_at * 3 + 1], rgbs[from_at * 3 + 2]], [jmhs[from_at * 3], jmhs[from_at * 3 + 1], jmhs[from_at * 3 + 2]])
+    out.put(0, out.rgb_at(6), [out.jmh[18], out.jmh[19], out.jmh[20] - 360.0])
+    out.put(7, out.rgb_at(1), [out.jmh[3], out.jmh[4], out.jmh[5] + 360.0])
+    return out
+
+## The limiting gamut's cube corners at the peak.
+func limiting_corners(cam: const Cam*, peak: f64) -> Corners:
+    var rgbs: f64[18]
+    var jmhs: f64[18]
+    for at in 0..<(usize)6:
+        let corner = cube_corner(at)
+        let rgb: f64[3] = [corner[0] * peak / reference_luminance, corner[1] * peak / reference_luminance, corner[2] * peak / reference_luminance]
+        let jmh = rgb_to_jmh(rgb, cam)
+        for c in 0..<(usize)3:
+            rgbs[at * 3 + c] = rgb[c]
+            jmhs[at * 3 + c] = jmh[c]
+    return arrange(rgbs, jmhs)
+
+## The reach gamut's cube corners scaled until their J is `limit_j`.
+func reach_corners(cam: const Cam*, limit_j: f64, maximum: f64) -> Corners:
+    let limit_a = j_to_a(limit_j, cam)
+    var rgbs: f64[18]
+    var jmhs: f64[18]
+    for at in 0..<(usize)6:
+        let corner = cube_corner(at)
+        var lower = 0.0
+        var upper = maximum
+        while upper - lower > 1.0e-3:
+            let probe = (lower + upper) / 2.0
+            let a = rgb_to_aab([corner[0] * probe, corner[1] * probe, corner[2] * probe], cam)[0]
+            if a < limit_a:
+                lower = probe
+            else:
+                upper = probe
+            if a == limit_a:
+                break
+        let jmh = rgb_to_jmh([corner[0] * upper, corner[1] * upper, corner[2] * upper], cam)
+        for c in 0..<(usize)3:
+            jmhs[at * 3 + c] = jmh[c]
+    return arrange(rgbs, jmhs)
+
+## The hue table from both gamuts' corner hues.
+func build_hue_table(reach: const Corners*, limiting: const Corners*) -> f64[363]:
+    # Merge both sorted lists of six hues, keeping each hue once.
+    var sorted: f64[12]
+    var count: usize = 0
+    var r: usize = 1
+    var d: usize = 1
+    while r < 7 or d < 7:
+        let reach_hue = reach.hue(r)
+        let display_hue = limiting.hue(d)
+        if reach_hue == display_hue:
+            sorted[count] = reach_hue
+            r += 1
+            d += 1
+        elif reach_hue < display_hue:
+            sorted[count] = reach_hue
+            r += 1
+        else:
+            sorted[count] = display_hue
+            d += 1
+        count += 1
+    # Where each corner hue lands among the 360 entries.
+    var samples: usize[14]
+    var last: usize = 1000000
+    var least: usize = 0 if sorted[0] == 0.0 else 1
+    for at in 0..<count:
+        let rounded = (usize)math.round(sorted[at])
+        var nominal = min_usize(max_usize(rounded, least), 359)
+        if last == nominal:
+            if at > 1 and samples[at - 2] != samples[at - 1] - 1:
+                samples[at - 1] = samples[at - 1] - 1
+            else:
+                nominal = nominal + 1
+        samples[at] = min_usize(nominal, 359)
+        last = nominal
+        least = nominal
+    var table: f64[363]
+    var total: usize = 0
+    fill_interval(&table, samples[0], 0.0, sorted[0], total + 1)
+    total += samples[0]
+    var at: usize = 1
+    while at < count:
+        let span = samples[at] - samples[at - 1]
+        fill_interval(&table, span, sorted[at - 1], sorted[at], total + 1)
+        total += span
+        at += 1
+    fill_interval(&table, 360 - total, sorted[at - 1], 360.0, total + 1)
+    table[0] = table[360] - 360.0
+    table[upper_wrap] = table[first_entry] + 360.0
+    table[upper_wrap + 1] = table[first_entry + 1] + 360.0
+    return table
+
+func fill_interval(table: f64[363]*, samples: usize, lower: f64, upper: f64, base: usize):
+    let delta = (upper - lower) / (f64)samples
+    for at in 0..<samples:
+        (*table)[base + at] = lower + (f64)at * delta
+
+func min_usize(a: usize, b: usize) -> usize:
+    return a if a < b else b
+
+func max_usize(a: usize, b: usize) -> usize:
+    return a if a > b else b
+
+## The limiting gamut's cusp (J, M) at `hue`, searched along the cube's edge between the
+## corners around it; `previous` carries the last edge and position, as hues ascend.
+func cusp_for_hue(hue: f64, corners: const Corners*, cam: const Cam*, previous: f64[2]*) -> f64[2]:
+    var upper_corner: usize = 1
+    for at in 1..<(usize)8:
+        if corners.hue(at) > hue:
+            upper_corner = at
+            break
+    let lower_corner = upper_corner - 1
+    if corners.hue(lower_corner) == hue:
+        return [corners.jmh[lower_corner * 3], corners.jmh[lower_corner * 3 + 1]]
+    let low_rgb = corners.rgb_at(lower_corner)
+    let high_rgb = corners.rgb_at(upper_corner)
+    var lower_t = (*previous)[1] if (f64)upper_corner == (*previous)[0] else 0.0
+    var upper_t = 1.0
+    while upper_t - lower_t > 1.0e-7:
+        let t = (lower_t + upper_t) / 2.0
+        let jmh = rgb_to_jmh([lerp(low_rgb[0], high_rgb[0], t), lerp(low_rgb[1], high_rgb[1], t), lerp(low_rgb[2], high_rgb[2], t)], cam)
+        if jmh[2] < corners.hue(lower_corner):
+            upper_t = t
+        elif jmh[2] >= corners.hue(upper_corner):
+            lower_t = t
+        elif jmh[2] > hue:
+            upper_t = t
+        else:
+            lower_t = t
+    let t = (lower_t + upper_t) / 2.0
+    let jmh = rgb_to_jmh([lerp(low_rgb[0], high_rgb[0], t), lerp(low_rgb[1], high_rgb[1], t), lerp(low_rgb[2], high_rgb[2], t)], cam)
+    (*previous)[0] = (f64)upper_corner
+    (*previous)[1] = t
+    return [jmh[0], jmh[1]]
+
+## The cusp table (J, M slightly widened for the smooth minimum, and the hue) for `hues`.
+func build_cusp_table(hues: const f64[363]*, corners: const Corners*, cam: const Cam*) -> f64[1089]:
+    var previous: f64[2] = [0.0, 0.0]
+    var table: f64[1089]
+    for at in first_entry..<upper_wrap:
+        let cusp = cusp_for_hue((*hues)[at], corners, cam, &previous)
+        table[at * 3] = cusp[0]
+        table[at * 3 + 1] = cusp[1] * (1.0 + smooth_m * smooth_cusps)
+        table[at * 3 + 2] = (*hues)[at]
+    copy_entry(&table, 0, 360)
+    table[2] = (*hues)[0]
+    copy_entry(&table, upper_wrap, first_entry)
+    table[upper_wrap * 3 + 2] = (*hues)[upper_wrap]
+    copy_entry(&table, upper_wrap + 1, first_entry + 1)
+    table[(upper_wrap + 1) * 3 + 2] = (*hues)[upper_wrap + 1]
+    return table
+
+func copy_entry(table: f64[1089]*, to_at: usize, from_at: usize):
+    (*table)[to_at * 3] = (*table)[from_at * 3]
+    (*table)[to_at * 3 + 1] = (*table)[from_at * 3 + 1]
+
+## How far from the uniform position the table's hues stray: the search range around it.
+func hue_search_range(cusps: const f64[1089]*) -> i64[2]:
+    var range: i64[2] = [0, 1]
+    for at in first_entry..<upper_wrap:
+        let position = (i64)first_entry + (i64)(*cusps)[at * 3 + 2]
+        let delta = (i64)at - position
+        range[0] = delta if delta < range[0] else range[0]
+        range[1] = delta + 1 if delta + 1 > range[1] else range[1]
+    return range

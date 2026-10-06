@@ -1,0 +1,54 @@
+#==============================================================================================
+#
+#   aces/linear - 3×3 matrices and 3-vectors for the output transform
+#
+#   DESCRIPTION:
+#       Row-major f64[9] matrices and f64[3] vectors, as the reference implementation writes
+#       them, and the primaries-to-XYZ matrices it uses (no chromatic adaptation: XYZ
+#       normalized so the primaries' own white has Y = 1).
+#
+#==============================================================================================
+
+## `m` times column vector `v`.
+func times(m: f64[9], v: f64[3]) -> f64[3]:
+    return [m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
+            m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
+            m[6] * v[0] + m[7] * v[1] + m[8] * v[2]]
+
+## The matrix product `a` · `b`.
+func product(a: f64[9], b: f64[9]) -> f64[9]:
+    var out: f64[9]
+    for row in 0..<(usize)3:
+        for column in 0..<(usize)3:
+            out[row * 3 + column] = a[row * 3] * b[column] + a[row * 3 + 1] * b[3 + column] + a[row * 3 + 2] * b[6 + column]
+    return out
+
+## The diagonal matrix of `v`.
+func diagonal(v: f64[3]) -> f64[9]:
+    return [v[0], 0.0, 0.0, 0.0, v[1], 0.0, 0.0, 0.0, v[2]]
+
+## The inverse of `m` (by cofactors; the matrices here are well conditioned).
+func inverse(m: f64[9]) -> f64[9]:
+    let a = m[4] * m[8] - m[5] * m[7]
+    let b = m[5] * m[6] - m[3] * m[8]
+    let c = m[3] * m[7] - m[4] * m[6]
+    let determinant = m[0] * a + m[1] * b + m[2] * c
+    let r = 1.0 / determinant
+    return [a * r, (m[2] * m[7] - m[1] * m[8]) * r, (m[1] * m[5] - m[2] * m[4]) * r,
+            b * r, (m[0] * m[8] - m[2] * m[6]) * r, (m[2] * m[3] - m[0] * m[5]) * r,
+            c * r, (m[1] * m[6] - m[0] * m[7]) * r, (m[0] * m[4] - m[1] * m[3]) * r]
+
+## Linear RGB in `primaries` to XYZ, the primaries' white at Y = 1, unadapted.
+func to_xyz_of(primaries: xyz.Primaries) -> f64[9]:
+    return xyz.rgb_to_xyz(primaries).m
+
+## XYZ to linear RGB in `primaries`, unadapted.
+func from_xyz_of(primaries: xyz.Primaries) -> f64[9]:
+    return inverse(to_xyz_of(primaries))
+
+## One RGB space to another through XYZ, unadapted.
+func rgb_to_rgb(source: xyz.Primaries, target: xyz.Primaries) -> f64[9]:
+    return product(from_xyz_of(target), to_xyz_of(source))
+
+func lerp(a: f64, b: f64, t: f64) -> f64:
+    return a + t * (b - a)

@@ -1,0 +1,137 @@
+#==============================================================================================
+#
+#   aces - The ACES 2.0 Output Transform
+#
+#   DESCRIPTION:
+#       Scene-referred ACES (AP0, or AP1 through apply_ap1) to display light for a display
+#       of a given peak luminance and limiting primaries, as the Academy's ACES 2.0 output
+#       transforms (aces-output) and OpenColorIO's builtin ACES2 transforms compute it:
+#
+#       1. the input clamped to AP1's positive range below the tonescale's forward limit;
+#       2. RGB to Hellwig 2022 JMh (aces/cam);
+#       3. the Daniele tonescale on J, and chroma compression (aces/tonescale);
+#       4. gamut compression into the limiting gamut (aces/gamut, tables in aces/tables);
+#       5. back to RGB in the limiting primaries, clamped to 0..peak/100.
+#
+#       The result is display-linear RGB in the limiting primaries with 1.0 = 100 cd/m²
+#       (so an SDR display's white is 1.0, a 1000-nit display's is 10.0). to_xyz gives the
+#       matrix to CIE XYZ (D65 for D65 primaries); encoding into other display primaries
+#       and the transfer function are the caller's (see `space`, `transfer`).
+#
+#       Computed in f64; OpenColorIO computes in f32, and its tables differ from these
+#       by its search tolerances, so the two agree to about 1e-4 of the peak.
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb       OutputTransform: create, apply, apply_ap1, to_xyz
+#       linear.lucb       3×3 matrices and primaries matrices
+#       cam.lucb          the JMh model
+#       tonescale.lucb    the tonescale and the chroma compression
+#       tables.lucb       the reach, hue and cusp tables
+#       gamut.lucb        the gamut compression and the upper hull's fit
+#
+#==============================================================================================
+
+from luce_std import math
+import xyz
+
+## A transform's parameters are outside what ACES 2.0 defines.
+pub let invalid: ErrorCode = ErrorCode.package(1)
+
+## One display's output transform, its tables precomputed (about 15 KB, built in a few
+## milliseconds).
+pub struct OutputTransform:
+    var peak: f64
+    var input: Cam
+    var output: Cam
+    var tones: Tones
+    var chroma: Chroma
+    var limit_j: f64
+    var gamma_inv: f64
+    var reach: f64[363]
+    var gamut: Gamut
+    var to_ap1: f64[9]
+    var from_ap1: f64[9]
+    var limiting_to_xyz: f64[9]
+
+    ## The transform for a display of `peak_nits` (100 for SDR, up to 10000) whose
+    ## colors are limited to `limiting`'s gamut.
+    pub static func create(peak_nits: f64, limiting: xyz.Primaries) -> OutputTransform!:
+        if not (peak_nits >= 48.0 and peak_nits <= 10000.0):
+            error(invalid, "an ACES 2.0 output transform needs a peak of 48 to 10000 nits")
+        var out = OutputTransform(peak = peak_nits)
+        out.input = cam_of(xyz.aces_ap0)
+        out.output = cam_of(limiting)
+        let reach_cam = cam_of(xyz.aces_ap1)
+        out.tones = tones_of(peak_nits)
+        out.chroma = chroma_of(peak_nits, &out.tones)
+        out.limit_j = y_to_j(peak_nits, &out.input)
+        out.gamma_inv = 1.0 / model_gamma()
+        out.reach = fill_reach_table(out.reach, &reach_cam, out.limit_j)
+        out.gamut.mid_j = y_to_j(out.tones.c_t * reference_luminance, &out.input)
+        out.gamut.focus_distance = focus_distance + focus_distance * focus_distance_scaling * out.tones.log_peak
+        out.gamut.lower_gamma_inv = 1.0 / (1.14 + 0.07 * out.tones.log_peak)
+        let reach_corners_found = reach_corners(&reach_cam, out.limit_j, out.tones.forward_limit)
+        let limiting_corners_found = limiting_corners(&out.output, peak_nits)
+        out.gamut.hues = build_hue_table(&reach_corners_found, &limiting_corners_found)
+        out.gamut.cusps = build_cusp_table(&out.gamut.hues, &limiting_corners_found, &out.output)
+        out.gamut.search = hue_search_range(&out.gamut.cusps)
+        fit_upper_hull(&out.gamut, peak_nits, out.limit_j, &out.output)
+        out.to_ap1 = rgb_to_rgb(xyz.aces_ap0, xyz.aces_ap1)
+        out.from_ap1 = inverse(out.to_ap1)
+        out.limiting_to_xyz = to_xyz_of(limiting)
+        return out
+
+    ## ACES2065-1 (AP0, scene-linear) to display-linear RGB in the limiting primaries,
+    ## 1.0 = 100 cd/m², clamped to 0..peak/100.
+    pub func apply(ap0: f64[3]) -> f64[3]:
+        # The input stays within AP1's positive range below the forward limit.
+        var ap1 = times(self.to_ap1, ap0)
+        for at in 0..<(usize)3:
+            ap1[at] = math.clamp(ap1[at], 0.0, self.tones.forward_limit)
+        return self.render(times(self.from_ap1, ap1))
+
+    ## The same from ACEScg (AP1, scene-linear).
+    pub func apply_ap1(ap1: f64[3]) -> f64[3]:
+        var clamped: f64[3]
+        for at in 0..<(usize)3:
+            clamped[at] = math.clamp(ap1[at], 0.0, self.tones.forward_limit)
+        return self.render(times(self.from_ap1, clamped))
+
+    func render(ap0: f64[3]) -> f64[3]:
+        let aab = rgb_to_aab(ap0, &self.input)
+        let jmh = aab_to_jmh(aab, &self.input)
+        let radians = jmh[2] * math.pi / 180.0
+        let cos_h = math.cos(radians)
+        let sin_h = math.sin(radians)
+        let reach_m = reach_at(&self.reach, jmh[2])
+        let m_norm = chroma_norm(cos_h, sin_h, self.chroma.scale)
+        let j_ts = tonescale_a_to_j(aab[0], &self.input, &self.tones)
+        let toned = chroma_compress(jmh, j_ts, m_norm, self.limit_j, self.gamma_inv, reach_m, &self.chroma)
+        let compressed = gamut_compress(toned, self.limit_j, self.gamma_inv, reach_m, &self.gamut)
+        let rgb = aab_to_rgb(jmh_to_aab(compressed, cos_h, sin_h, &self.output), &self.output)
+        let roof = self.peak / reference_luminance
+        return [math.clamp(rgb[0], 0.0, roof), math.clamp(rgb[1], 0.0, roof), math.clamp(rgb[2], 0.0, roof)]
+
+    ## The limiting primaries' RGB to CIE XYZ (their own white at Y = 1), row-major.
+    pub func to_xyz() -> f64[9]:
+        return self.limiting_to_xyz
+
+    ## The peak, in cd/m².
+    pub func peak_nits() -> f64:
+        return self.peak
+
+test "grey is neutral, SDR white is 1.0 and the curve rises":
+    let transform = try OutputTransform.create(100.0, xyz.srgb)
+    let grey = transform.apply([0.18, 0.18, 0.18])
+    assert(math.abs(grey[0] - grey[1]) < 1.0e-6 and math.abs(grey[1] - grey[2]) < 1.0e-6)
+    # 18% grey shows near 10 nits (0.1).
+    assert(grey[1] > 0.09 and grey[1] < 0.11)
+    let bright = transform.apply([1000.0, 1000.0, 1000.0])
+    assert(math.abs(bright[0] - 1.0) < 1.0e-3 and math.abs(bright[2] - 1.0) < 1.0e-3)
+    var previous = -1.0
+    for step in 0..<(usize)40:
+        let v = 0.001 * math.exp2((f64)step * 0.5)
+        let shown = transform.apply([v, v, v])[1]
+        assert(shown >= previous)
+        previous = shown

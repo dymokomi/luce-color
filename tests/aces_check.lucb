@@ -1,0 +1,66 @@
+## Hold the aces module to OpenColorIO: every line of the fixture named first (made by
+## make_aces_fixtures.py) is a transform, an ACES2065-1 color and OpenColorIO's CIE XYZ
+## for it. Prints the largest difference per transform, relative to its peak (1.0 at
+## 100 nits), and fails past `tolerance`.
+import c
+import strings
+from luce_std import files
+from luce_std import math
+from luce_color import aces
+from luce_color import xyz
+
+let tolerance: f64 = 1.0e-4
+
+## The next space-separated field of `line` from `at`, and where the one after starts.
+func field(line: str, at: usize) -> (str, usize):
+    var end = at
+    while end < line.length and line.bytes[end] != ' ':
+        end += 1
+    return ((str)line.bytes[at..<end], end + 1)
+
+pub func main(arguments: str[]) -> i32!:
+    let name = try strings.copy(arguments[1])
+    defer strings.release(name)
+    let text = try files.read((c.str)name)
+    defer text.release()
+    let keys: str[4] = ["sdr100_rec709", "sdr100_p3", "hdr1000_p3", "hdr1000_rec2020"]
+    var transforms: aces.OutputTransform[4] = ---
+    transforms[0] = try aces.OutputTransform.create(100.0, xyz.srgb)
+    transforms[1] = try aces.OutputTransform.create(100.0, xyz.display_p3)
+    transforms[2] = try aces.OutputTransform.create(1000.0, xyz.display_p3)
+    transforms[3] = try aces.OutputTransform.create(1000.0, xyz.rec2020)
+    var worst: f64[4]
+    var counts: i64[4]
+    let data = (str)text.value
+    var first: usize = 0
+    while first < data.length:
+        var end = first
+        while end < data.length and data.bytes[end] != '\n':
+            end += 1
+        let line = (str)data.bytes[first..<end]
+        first = end + 1
+        if line.length == 0:
+            continue
+        var values: f64[6]
+        var (key, at) = field(line, 0)
+        for slot in 0..<(usize)6:
+            let (piece, next) = field(line, at)
+            values[slot] = try strings.parse_f64(piece)
+            at = next
+        for which in 0..<(usize)4:
+            if keys[which] != key:
+                continue
+            let transform = &transforms[which]
+            let rgb = transform.apply([values[0], values[1], values[2]])
+            let m = transform.to_xyz()
+            let peak = transform.peak_nits() / 100.0
+            for row in 0..<(usize)3:
+                let found = m[row * 3] * rgb[0] + m[row * 3 + 1] * rgb[1] + m[row * 3 + 2] * rgb[2]
+                worst[which] = math.max(worst[which], math.abs(found - values[3 + row]) / peak)
+            counts[which] += 1
+    var failed = false
+    for which in 0..<(usize)4:
+        print(f"{keys[which]}: {counts[which]} colors, largest difference {worst[which]} of the peak")
+        if worst[which] > tolerance or counts[which] == 0:
+            failed = true
+    return 1 if failed else 0
