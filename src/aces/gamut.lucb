@@ -8,7 +8,10 @@
 #       color sits relative to the hue's cusp. The gamut's boundary on that line is
 #       estimated from the cusp, a fixed lower-hull gamma and the upper-hull gamma fitted
 #       per hue (fit_upper_hull); M past a threshold is remapped with a Reinhard curve so
-#       the reach gamut's boundary lands on the limiting gamut's.
+#       the reach gamut's boundary lands on the limiting gamut's. The inverse
+#       (gamut_decompress) remaps back along the same line; its focus gain depends on
+#       the uncompressed J, found by one compression step above the gain's threshold,
+#       as OpenColorIO's ACES2 inverse does.
 #
 #==============================================================================================
 
@@ -105,7 +108,9 @@ func boundary_m(cusp_j: f64, cusp_m: f64, j_max: f64, gamma_top_inv: f64, gamma_
     let upper = line_hull_m(j_max - intersect, -slope, gamma_top_inv, j_max - cusp_j, cusp_m, j_max - intersect_cusp)
     return smooth_min(lower, upper, cusp_m)
 
-func remap_m(m: f64, gamut_m: f64, reach_m: f64) -> f64:
+## M past the threshold squeezed so `reach_m` lands on `gamut_m`; `invert`
+## undoes it (M at the gamut's boundary goes back to the reach's).
+func remap_m(m: f64, gamut_m: f64, reach_m: f64, invert: bool = false) -> f64:
     let proportion = math.max(gamut_m / reach_m, compression_threshold)
     let threshold = proportion * gamut_m
     if m <= threshold or proportion >= 1.0:
@@ -113,11 +118,18 @@ func remap_m(m: f64, gamut_m: f64, reach_m: f64) -> f64:
     let gamut_offset = gamut_m - threshold
     let reach_offset = reach_m - threshold
     let scale = reach_offset / ((reach_offset / gamut_offset) - 1.0)
+    if invert:
+        let squeezed = (m - threshold) / scale
+        if squeezed >= 1.0:
+            return reach_m
+        return threshold + scale * squeezed / (1.0 - squeezed)
     let nd = (m - threshold) / scale
     return threshold + scale * nd / (1.0 + nd)
 
-func compress(jmh: f64[3], limit_j: f64, gamma_inv: f64, reach_m: f64, gamut: const Gamut*, hue: const HueGamut*) -> f64[3]:
-    let gain = focus_gain(jmh[0], hue.threshold, limit_j, gamut.focus_distance)
+## Compress (or with `invert`, uncompress) `jmh` along its line toward the focus;
+## the line's slope follows the focus gain at J `jx`, the uncompressed J.
+func compress(jmh: f64[3], jx: f64, limit_j: f64, gamma_inv: f64, reach_m: f64, gamut: const Gamut*, hue: const HueGamut*, invert: bool = false) -> f64[3]:
+    let gain = focus_gain(jx, hue.threshold, limit_j, gamut.focus_distance)
     let intersect = j_intersect(jmh[0], jmh[1], hue.focus_j, limit_j, gain)
     let slope = vector_slope(intersect, hue.focus_j, limit_j, gain)
     let intersect_cusp = j_intersect(hue.cusp_j, hue.cusp_m, hue.focus_j, limit_j, gain)
@@ -125,7 +137,7 @@ func compress(jmh: f64[3], limit_j: f64, gamma_inv: f64, reach_m: f64, gamut: co
     if gamut_m <= 0.0:
         return [jmh[0], 0.0, jmh[2]]
     let reach_boundary = line_hull_m(intersect, slope, gamma_inv, limit_j, reach_m, limit_j)
-    let remapped = remap_m(jmh[1], gamut_m, reach_boundary)
+    let remapped = remap_m(jmh[1], gamut_m, reach_boundary, invert)
     return [intersect + remapped * slope, remapped, jmh[2]]
 
 func gamut_compress(jmh: f64[3], limit_j: f64, gamma_inv: f64, reach_m: f64, gamut: const Gamut*) -> f64[3]:
@@ -134,7 +146,20 @@ func gamut_compress(jmh: f64[3], limit_j: f64, gamma_inv: f64, reach_m: f64, gam
     if jmh[1] <= 0.0 or jmh[0] > limit_j:
         return [jmh[0], 0.0, jmh[2]]
     let hue = hue_gamut(jmh[2], limit_j, gamut)
-    return compress(jmh, limit_j, gamma_inv, reach_m, gamut, &hue)
+    return compress(jmh, jmh[0], limit_j, gamma_inv, reach_m, gamut, &hue)
+
+## gamut_compress's inverse.
+func gamut_decompress(jmh: f64[3], limit_j: f64, gamma_inv: f64, reach_m: f64, gamut: const Gamut*) -> f64[3]:
+    if jmh[0] <= 0.0:
+        return [0.0, 0.0, jmh[2]]
+    if jmh[1] <= 0.0 or jmh[0] > limit_j:
+        return [jmh[0], 0.0, jmh[2]]
+    let hue = hue_gamut(jmh[2], limit_j, gamut)
+    var jx = jmh[0]
+    # Above the threshold the gain depends on J: estimate the uncompressed J first.
+    if jx > hue.threshold:
+        jx = compress(jmh, jx, limit_j, gamma_inv, reach_m, gamut, &hue, true)[0]
+    return compress(jmh, jx, limit_j, gamma_inv, reach_m, gamut, &hue, true)
 
 ## Fit each hue's upper-hull gamma: the smallest that puts the boundary estimate outside
 ## the limiting gamut at five test lightnesses between the cusp and the peak.

@@ -13,6 +13,12 @@
 #       4. gamut compression into the limiting gamut (aces/gamut, tables in aces/tables);
 #       5. back to RGB in the limiting primaries, clamped to 0..peak/100.
 #
+#       `invert` and `invert_ap1` run the steps backward (OpenColorIO's inverse ACES2
+#       output transform): display light to the scene light the forward transform
+#       shows as it, for bringing display-referred pictures (JPEGs, textures, screen
+#       captures) into a scene so they show unchanged. Display white goes to the scene
+#       light that reaches the peak, so it shows white, not grey.
+#
 #       The result is display-linear RGB in the limiting primaries with 1.0 = 100 cd/m²
 #       (so an SDR display's white is 1.0, a 1000-nit display's is 10.0). to_xyz gives the
 #       matrix to CIE XYZ (D65 for D65 primaries); encoding into other display primaries
@@ -23,7 +29,7 @@
 #
 #       Fragments, in ORDER:
 #
-#       module.lucb       OutputTransform: create, apply, apply_ap1, to_xyz
+#       module.lucb       OutputTransform: create, apply, apply_ap1, invert, invert_ap1, to_xyz
 #       linear.lucb       3×3 matrices and primaries matrices
 #       cam.lucb          the JMh model
 #       tonescale.lucb    the tonescale and the chroma compression
@@ -113,6 +119,26 @@ pub struct OutputTransform:
         let roof = self.peak / reference_luminance
         return [math.clamp(rgb[0], 0.0, roof), math.clamp(rgb[1], 0.0, roof), math.clamp(rgb[2], 0.0, roof)]
 
+    ## `apply`'s inverse: display-linear RGB in the limiting primaries (1.0 = 100
+    ## cd/m², clamped to 0..peak/100) to ACES2065-1 (AP0, scene-linear).
+    pub func invert(display: f64[3]) -> f64[3]:
+        let roof = self.peak / reference_luminance
+        let rgb: f64[3] = [math.clamp(display[0], 0.0, roof), math.clamp(display[1], 0.0, roof), math.clamp(display[2], 0.0, roof)]
+        let shown = rgb_to_jmh(rgb, &self.output)
+        let radians = shown[2] * math.pi / 180.0
+        let cos_h = math.cos(radians)
+        let sin_h = math.sin(radians)
+        let reach_m = reach_at(&self.reach, shown[2])
+        let toned = gamut_decompress(shown, self.limit_j, self.gamma_inv, reach_m, &self.gamut)
+        let j = untonescale_j(toned[0], &self.input, &self.tones)
+        let m_norm = chroma_norm(cos_h, sin_h, self.chroma.scale)
+        let scene = chroma_decompress(toned, j, m_norm, self.limit_j, self.gamma_inv, reach_m, &self.chroma)
+        return aab_to_rgb(jmh_to_aab(scene, cos_h, sin_h, &self.input), &self.input)
+
+    ## The same to ACEScg (AP1, scene-linear).
+    pub func invert_ap1(display: f64[3]) -> f64[3]:
+        return times(self.to_ap1, self.invert(display))
+
     ## The limiting primaries' RGB to CIE XYZ (their own white at Y = 1), row-major.
     pub func to_xyz() -> f64[9]:
         return self.limiting_to_xyz
@@ -135,3 +161,27 @@ test "grey is neutral, SDR white is 1.0 and the curve rises":
         let shown = transform.apply([v, v, v])[1]
         assert(shown >= previous)
         previous = shown
+
+test "the inverse brings display light back to what the forward transform shows":
+    let transform = try OutputTransform.create(100.0, xyz.srgb)
+    # White shows white again, not grey.
+    let white = transform.apply(transform.invert([1.0, 1.0, 1.0]))
+    assert(math.abs(white[0] - 1.0) < 2.0e-3 and math.abs(white[1] - 1.0) < 2.0e-3 and math.abs(white[2] - 1.0) < 2.0e-3)
+    var worst = 0.0
+    for r in 0..<(usize)9:
+        for g in 0..<(usize)9:
+            for b in 0..<(usize)9:
+                let display: f64[3] = [(f64)r / 8.0 * 0.999, (f64)g / 8.0 * 0.999, (f64)b / 8.0 * 0.999]
+                let back = transform.apply(transform.invert(display))
+                for at in 0..<(usize)3:
+                    worst = math.max(worst, math.abs(back[at] - display[at]))
+    print(f"inverse round trip: worst {worst}")
+    assert(worst < 2.0e-3)
+
+test "scene light within the gamut comes back through the inverse":
+    let transform = try OutputTransform.create(100.0, xyz.srgb)
+    for value in [[0.18, 0.18, 0.18], [0.05, 0.02, 0.01], [0.4, 0.3, 0.2], [1.5, 1.0, 0.6]]:
+        let scene: f64[3] = value
+        let back = transform.invert_ap1(transform.apply_ap1(scene))
+        for at in 0..<(usize)3:
+            assert(math.abs(back[at] - scene[at]) < 1.0e-3 * (1.0 + scene[at]))

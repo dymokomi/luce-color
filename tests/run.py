@@ -53,10 +53,10 @@ with tempfile.TemporaryDirectory() as tmp:
             sweep = subprocess.run([tool, "--formats", profile], check=True, cwd=FIXTURES, capture_output=True, timeout=300).stdout
             if hashlib.sha256(sweep).hexdigest() != digest:
                 raise SystemExit(f"FAIL icc_tool {flags[0]} --formats {profile}: the pixels differ from skcms's")
-# ACES 2.0 against OpenColorIO's builtin output transforms (tests/make_aces_fixtures.py).
+# ACES 2.0 and its inverse against OpenColorIO's builtin output transforms (tests/make_aces_fixtures.py).
 with tempfile.TemporaryDirectory() as tmp:
     for flags in MODES:
         tool = Path(tmp) / f"aces_check{flags[0].replace('-', '_').replace('=', '_')}"
         run([base, "build", ROOT / "tests/aces_check.lucb", *flags, "-o", tool])
-        run([tool, ROOT / "tests/fixtures/aces/reference.txt"])
-print("PASS luce-color color science: Oklab, transfer curves, XYZ, Lab, CAM16, HSL, spaces, ACES 2.0 (OpenColorIO's within 1e-4) and ICC (skcms's dumps and Skia's color spaces to the bit), native and comparison modes")
+        run([tool, ROOT / "tests/fixtures/aces/reference.txt", ROOT / "tests/fixtures/aces/inverse.txt"])
+print("PASS luce-color color science: Oklab, transfer curves, XYZ, Lab, CAM16, HSL, spaces, ACES 2.0 (OpenColorIO's within 1e-4) and its inverse and ICC (skcms's dumps and Skia's color spaces to the bit), native and comparison modes")

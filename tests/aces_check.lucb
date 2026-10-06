@@ -1,7 +1,13 @@
 ## Hold the aces module to OpenColorIO: every line of the fixture named first (made by
 ## make_aces_fixtures.py) is a transform, an ACES2065-1 color and OpenColorIO's CIE XYZ
 ## for it. Prints the largest difference per transform, relative to its peak (1.0 at
-## 100 nits), and fails past `tolerance`.
+## 100 nits), and fails past `tolerance`. The fixture named second, if any, holds the
+## inverse transforms: a display XYZ and OpenColorIO's ACES2065-1 for it. Scene colors
+## below `steep` times reference white are compared relative to their size
+## (`inverse_tolerance`), and both answers, shown again, must agree within
+## `shown_tolerance` of the peak. Within about 2% of the peak the inverse is so steep
+## (display 0.99 is scene 30 to 140) that OpenColorIO's f32 and this f64 land a few
+## ten-thousandths of the peak apart, each about as far from the display color.
 import c
 import strings
 from luce_std import files
@@ -10,6 +16,10 @@ from luce_color import aces
 from luce_color import xyz
 
 let tolerance: f64 = 1.0e-4
+let inverse_tolerance: f64 = 2.0e-3
+let shown_tolerance: f64 = 1.0e-3
+## Scene colors past this many times reference white are where the inverse is steep.
+let steep: f64 = 10.0
 
 ## The next space-separated field of `line` from `at`, and where the one after starts.
 func field(line: str, at: usize) -> (str, usize):
@@ -17,6 +27,26 @@ func field(line: str, at: usize) -> (str, usize):
     while end < line.length and line.bytes[end] != ' ':
         end += 1
     return ((str)line.bytes[at..<end], end + 1)
+
+## The inverse of 3 × 3 `m` (row-major), by cofactors.
+func inverted(m: f64[9]) -> f64[9]:
+    let first = m[4] * m[8] - m[5] * m[7]
+    let second = m[5] * m[6] - m[3] * m[8]
+    let third = m[3] * m[7] - m[4] * m[6]
+    let d = 1.0 / (m[0] * first + m[1] * second + m[2] * third)
+    return [first * d, (m[2] * m[7] - m[1] * m[8]) * d, (m[1] * m[5] - m[2] * m[4]) * d,
+            second * d, (m[0] * m[8] - m[2] * m[6]) * d, (m[2] * m[3] - m[0] * m[5]) * d,
+            third * d, (m[1] * m[6] - m[0] * m[7]) * d, (m[0] * m[4] - m[1] * m[3]) * d]
+
+func times(m: f64[9], v: f64[3]) -> f64[3]:
+    return [m[0] * v[0] + m[1] * v[1] + m[2] * v[2], m[3] * v[0] + m[4] * v[1] + m[5] * v[2], m[6] * v[0] + m[7] * v[1] + m[8] * v[2]]
+
+## The transform index of `key` among `keys`, or -1.
+func index_of(keys: const str[], key: str) -> i64:
+    for (index, known) in keys.indexed():
+        if known == key:
+            return (i64)index
+    return -1
 
 pub func main(arguments: str[]) -> i32!:
     let name = try strings.copy(arguments[1])
@@ -62,5 +92,49 @@ pub func main(arguments: str[]) -> i32!:
     for which in 0..<(usize)4:
         print(f"{keys[which]}: {counts[which]} colors, largest difference {worst[which]} of the peak")
         if worst[which] > tolerance or counts[which] == 0:
+            failed = true
+    if arguments.length < 3:
+        return 1 if failed else 0
+    let inverse_name = try strings.copy(arguments[2])
+    defer strings.release(inverse_name)
+    let inverse_text = try files.read((c.str)inverse_name)
+    defer inverse_text.release()
+    var scene_worst: f64[4]
+    var shown_worst: f64[4]
+    var inverse_counts: i64[4]
+    let inverse_data = (str)inverse_text.value
+    first = 0
+    while first < inverse_data.length:
+        var end = first
+        while end < inverse_data.length and inverse_data.bytes[end] != '\n':
+            end += 1
+        let line = (str)inverse_data.bytes[first..<end]
+        first = end + 1
+        if line.length == 0:
+            continue
+        var values: f64[6]
+        var (key, at) = field(line, 0)
+        for slot in 0..<(usize)6:
+            let (piece, next) = field(line, at)
+            values[slot] = try strings.parse_f64(piece)
+            at = next
+        let which = index_of(keys, key)
+        if which < 0:
+            continue
+        let transform = &transforms[(usize)which]
+        let display = times(inverted(transform.to_xyz()), [values[0], values[1], values[2]])
+        let ours = transform.invert(display)
+        let peak = transform.peak_nits() / 100.0
+        let theirs: f64[3] = [values[3], values[4], values[5]]
+        let ours_shown = transform.apply(ours)
+        let theirs_shown = transform.apply(theirs)
+        for channel in 0..<(usize)3:
+            if math.abs(theirs[channel]) < steep:
+                scene_worst[(usize)which] = math.max(scene_worst[(usize)which], math.abs(ours[channel] - theirs[channel]) / (math.abs(theirs[channel]) + 0.01))
+            shown_worst[(usize)which] = math.max(shown_worst[(usize)which], math.abs(ours_shown[channel] - theirs_shown[channel]) / peak)
+        inverse_counts[(usize)which] += 1
+    for which in 0..<(usize)4:
+        print(f"{keys[which]} inverse: {inverse_counts[which]} colors, scene {scene_worst[which]} relative, shown again {shown_worst[which]} of the peak")
+        if scene_worst[which] > inverse_tolerance or shown_worst[which] > shown_tolerance or inverse_counts[which] == 0:
             failed = true
     return 1 if failed else 0

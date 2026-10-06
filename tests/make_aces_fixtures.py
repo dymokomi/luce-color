@@ -3,6 +3,8 @@
 (builtins "ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - ...") applied to a fixed grid of
 ACES2065-1 colors: greys from black to far past white, saturated and near-primary colors,
 random colors spread over 20 stops. Each line: transform, then AP0 r g b, then XYZ.
+And tests/fixtures/aces/inverse.txt: the same transforms inverted, applied to the display
+colors the forward ones made. Each line: transform, then XYZ, then AP0 r g b.
 
     python3 -m venv build/venv && build/venv/bin/pip install opencolorio
     build/venv/bin/python tests/make_aces_fixtures.py
@@ -28,10 +30,16 @@ for _ in range(400):
     samples.append(tuple(level * rng.uniform(0, 1) ** 2 for _ in range(3)))
 config = ocio.Config.CreateRaw()
 lines = []
+inverse = []
 for key, name in TRANSFORMS.items():
-    processor = config.getProcessor(ocio.BuiltinTransform("ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - " + name)).getDefaultCPUProcessor()
+    builtin = ocio.BuiltinTransform("ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - " + name)
+    processor = config.getProcessor(builtin).getDefaultCPUProcessor()
+    backward = config.getProcessor(builtin, ocio.TRANSFORM_DIR_INVERSE).getDefaultCPUProcessor()
     for rgb in samples:
         out = processor.applyRGB(list(rgb))
         lines.append(" ".join([key] + ["%.9g" % v for v in rgb] + ["%.7g" % v for v in out]))
+        back = backward.applyRGB(list(out))
+        inverse.append(" ".join([key] + ["%.7g" % v for v in out] + ["%.9g" % v for v in back]))
 (ROOT / "tests/fixtures/aces/reference.txt").write_text("\n".join(lines) + "\n")
-print(f"{len(lines)} references (OpenColorIO {ocio.__version__})")
+(ROOT / "tests/fixtures/aces/inverse.txt").write_text("\n".join(inverse) + "\n")
+print(f"{len(lines)} references, {len(inverse)} inverse references (OpenColorIO {ocio.__version__})")

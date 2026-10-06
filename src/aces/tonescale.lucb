@@ -9,6 +9,7 @@
 #       grows with the peak. It is applied to J through luminance. The chroma compression
 #       then scales M with J's change and compresses it toward a hue-dependent limit set
 #       by the reach gamut (AP1) at the peak, with a toe that keeps shadows saturated.
+#       Each step has an exact inverse (the `un` functions), for the inverse transform.
 #
 #==============================================================================================
 
@@ -54,6 +55,22 @@ func tonescale(y: f64, tones: const Tones*) -> f64:
     let f = tones.m_2 * math.pow(y / (y + tones.s_2), tones.g)
     return math.max(0.0, f * f / (f + tones.t_1)) * tones.n_r
 
+## Scene luminance for display luminance `y`: tonescale's inverse, held below
+## the scene light that reaches the peak (`forward_limit`).
+func untonescale(y: f64, tones: const Tones*) -> f64:
+    let h = math.max(0.0, y / tones.n_r)
+    # f²/(f + t_1) = h, for f.
+    let f = 0.5 * (h + math.sqrt(h * h + 4.0 * h * tones.t_1))
+    let a = math.pow(f / tones.m_2, 1.0 / tones.g)
+    if a >= 1.0:
+        return tones.forward_limit * reference_luminance
+    return math.min(tones.s_2 * a / (1.0 - a), tones.forward_limit * reference_luminance)
+
+## The scene J whose tonemapped J is `j_ts`.
+func untonescale_j(j_ts: f64, cam: const Cam*, tones: const Tones*) -> f64:
+    let scene = untonescale(j_to_y(j_ts, cam), tones)
+    return math.copysign(y_to_j(scene, cam), j_ts)
+
 ## The tonemapped J of achromatic `a`.
 func tonescale_a_to_j(a: f64, cam: const Cam*, tones: const Tones*) -> f64:
     let toned = tonescale(a_to_y(a, cam), tones)
@@ -93,6 +110,16 @@ func toe(x: f64, limit: f64, k1_in: f64, k2_in: f64) -> f64:
     let minus_ac = k2 * k3 * x
     return 0.5 * (minus_b + math.sqrt(minus_b * minus_b + 4.0 * minus_ac))
 
+## The toe's inverse: the `x` whose toe is `y`.
+func untoe(y: f64, limit: f64, k1_in: f64, k2_in: f64) -> f64:
+    if y > limit:
+        return y
+    let k2 = math.max(k2_in, 0.001)
+    let k1 = math.sqrt(k1_in * k1_in + k2 * k2)
+    let k3 = (limit + k1) / (limit + k2)
+    # toe solves y² + k1·y = k3·x·(y + k2).
+    return (y * y + k1 * y) / (k3 * (y + k2))
+
 ## The compressed JMh for `jmh` whose tonemapped J is `j_ts`; `m_norm` is
 ## chroma_norm's, `limit_j` the peak's J and `reach_m` the reach gamut's M at it.
 func chroma_compress(jmh: f64[3], j_ts: f64, m_norm: f64, limit_j: f64, gamma_inv: f64, reach_m: f64, chroma: const Chroma*) -> f64[3]:
@@ -107,3 +134,15 @@ func chroma_compress(jmh: f64[3], j_ts: f64, m_norm: f64, limit_j: f64, gamma_in
     compressed = limit - toe(limit - compressed, limit - 0.001, snj * chroma.sat, math.sqrt(nj * nj + chroma.sat_threshold))
     compressed = toe(compressed, limit, nj * chroma.compression, snj)
     return [j_ts, compressed * m_norm, jmh[2]]
+
+## chroma_compress's inverse: the scene JMh, of scene J `j`, for compressed `jmh`.
+func chroma_decompress(jmh: f64[3], j: f64, m_norm: f64, limit_j: f64, gamma_inv: f64, reach_m: f64, chroma: const Chroma*) -> f64[3]:
+    let j_ts = jmh[0]
+    if jmh[1] == 0.0 or j_ts <= 0.0 or j <= 0.0:
+        return [j, 0.0, jmh[2]]
+    let nj = j_ts / limit_j
+    let snj = math.max(0.0, 1.0 - nj)
+    let limit = math.pow(nj, gamma_inv) * reach_m / m_norm
+    var m = untoe(jmh[1] / m_norm, limit, nj * chroma.compression, snj)
+    m = limit - untoe(limit - m, limit - 0.001, snj * chroma.sat, math.sqrt(nj * nj + chroma.sat_threshold))
+    return [j, m * m_norm * math.pow(j_ts / j, -gamma_inv), jmh[2]]
