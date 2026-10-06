@@ -39,6 +39,7 @@
 #       color_space.lucb        Skia's SkColorSpace and its named primaries and curves
 #       xform_steps.lucb        Skia's SkColorSpaceXformSteps
 #       bridge.lucb             `transfer.Transfer`, `xyz.Primaries`, `space.ColorSpace`
+#       write.lucb              writing ICC v4 matrix/TRC display profiles (sRGB, Display P3)
 #
 #       Copyright 2018 Google Inc. (skcms, Skia); port copyright 2026 the luce-color authors.
 #       SPDX-License-Identifier: BSD-3-Clause

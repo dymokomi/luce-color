@@ -1,0 +1,33 @@
+#==============================================================================================
+#
+#   tests/icc/write - Writing display profiles and reading them back
+#
+#==============================================================================================
+from color import Color
+from luce_std import math
+
+test "written profiles parse back to their curve and matrix":
+    for name in ["sRGB", "Display P3", "Rec. 2020"]:
+        var out: Buffer
+        defer out.destroy()
+        try write_named_profile(&out, name)
+        let profile = parse(out.view()) else trap("a written profile did not parse")
+        assert(profile.has_trc and profile.has_to_xyzd50 and profile.data_color_space == signature_rgb)
+        assert(out.view().length % 4 == 0 and (u32)out.view().length == profile.size)
+
+test "pixels through the written Display P3 profile land where space.convert puts them":
+    var out: Buffer
+    defer out.destroy()
+    try write_named_profile(&out, "Display P3")
+    let p3 = parse(out.view()) else trap("P3 did not parse")
+    let srgb = Profile.srgb()
+    let samples: f32[12] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.2, 0.4, 0.9, 0.5, 0.5, 0.5]
+    var shown: f32[12]
+    assert(transform(u8[]((u8*)&samples[0], 48), .rgb_fff, .opaque, &srgb, u8[]((u8*)&shown[0], 48), .rgb_fff, .opaque, &p3, 4))
+    for at in 0..<(usize)4:
+        let linear = Color(transfer.srgb_decode((f64)samples[at * 3]), transfer.srgb_decode((f64)samples[at * 3 + 1]), transfer.srgb_decode((f64)samples[at * 3 + 2]))
+        let moved = xyz.convert(linear, xyz.srgb, xyz.display_p3)
+        let expected: f64[3] = [moved.red, moved.green, moved.blue]
+        for channel in 0..<(usize)3:
+            let want = transfer.srgb_encode(expected[channel])
+            assert(math.abs((f64)shown[at * 3 + channel] - want) < 1.0e-3, "a pixel left the P3 profile wrongly")

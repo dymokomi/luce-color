@@ -1,0 +1,166 @@
+#==============================================================================================
+#
+#   icc/write - Writing small ICC v4 display profiles
+#
+#   DESCRIPTION:
+#       The profile an encoded image carries so readers know its colors: an ICC v4
+#       monitor-class matrix/TRC profile, the kind sRGB and Display P3 images embed. Its tags
+#       are desc and cprt (mluc), wtpt (D50, as v4 says), chad (the Bradford adaptation from
+#       the display's white to D50), rXYZ, gXYZ and bXYZ (the primaries' columns of the
+#       matrix to XYZ D50) and one para curve the three TRC tags share. The profile ID is
+#       left zero, which the spec allows ("not calculated"). The layout follows ICC.1:2022;
+#       the reader is parse.lucb.
+#
+#==============================================================================================
+from luce_std.collections import Buffer
+
+## A profile could not be written: a white or primaries outside 0..1, or an unknown name.
+pub let invalid_profile: ErrorCode = ErrorCode.package(2)
+
+## Append the ICC v4 display profile described by `description`, the transfer
+## curve `curve`, linear RGB to XYZ D50 `to_xyzd50` and the display white
+## (`white_x`, `white_y`) to `out`.
+pub func write_profile(out: Buffer*, description: str, curve: const TransferFunction*, to_xyzd50: const Matrix3x3*, white_x: f32, white_y: f32) -> !:
+    let adaptation = adapt_to_xyzd50(white_x, white_y) else error(invalid_profile, "the white is outside 0..1")
+    var tags: Buffer
+    defer tags.destroy()
+    # Each tag's data, padded to four bytes, and where it starts and how long it is.
+    var offsets: u32[6]
+    var sizes: u32[6]
+    let writers = 6
+    for at in 0..<(usize)writers:
+        offsets[at] = (u32)tags.length()
+        match at:
+            0:
+                try mluc(&tags, description)
+            1:
+                try mluc(&tags, "No copyright, use freely")
+            2:
+                try xyz_tag(&tags, 0.9642, 1.0, 0.8249)
+            3:
+                try tags.put(b"sf32")
+                try zeros(&tags, 4)
+                for row in 0..<(usize)3:
+                    for column in 0..<(usize)3:
+                        try fixed(&tags, adaptation.vals[row][column])
+            4:
+                # The three primaries one after another; each tag points into this block.
+                for column in 0..<(usize)3:
+                    try xyz_tag(&tags, to_xyzd50.vals[0][column], to_xyzd50.vals[1][column], to_xyzd50.vals[2][column])
+            _:
+                try para(&tags, curve)
+        sizes[at] = (u32)tags.length() - offsets[at]
+        while tags.length() % 4 != 0:
+            try tags.put_byte(0)
+    # desc cprt wtpt chad rXYZ gXYZ bXYZ rTRC gTRC bTRC
+    let signatures: u32[10] = [0x64657363, 0x63707274, 0x77747074, 0x63686164, 0x7258595A, 0x6758595A, 0x6258595A, 0x72545243, 0x67545243, 0x62545243]
+    let header_and_table: u32 = 128 + 4 + 10 * 12
+    let total = header_and_table + (u32)tags.length()
+    # The header.
+    let start = out.length()
+    try u32_be(out, total)
+    try zeros(out, 4)
+    try u32_be(out, 0x04300000)
+    try out.put(b"mntrRGB XYZ ")
+    # 2026-01-01 00:00:00.
+    for value in [2026, 1, 1, 0, 0, 0]:
+        try u16_be(out, (u16)value)
+    try out.put(b"acsp")
+    try zeros(out, 4 + 4 + 4 + 4 + 8)
+    # Perceptual intent, then the D50 illuminant.
+    try u32_be(out, 0)
+    try fixed(out, 0.9642)
+    try fixed(out, 1.0)
+    try fixed(out, 0.8249)
+    try zeros(out, 4 + 16 + 28)
+    if out.length() - start != 128:
+        error(invalid_profile, "the ICC header is not 128 bytes")
+    # The tag table.
+    try u32_be(out, 10)
+    for (at, signature) in signatures.indexed():
+        var block: usize = 0
+        var offset: u32 = 0
+        var size: u32 = 0
+        if at <= 3:
+            block = at
+            offset = offsets[block]
+            size = sizes[block]
+        elif at <= 6:
+            offset = offsets[4] + (u32)(at - 4) * 20
+            size = 20
+        else:
+            offset = offsets[5]
+            size = sizes[5]
+        _ = block
+        try u32_be(out, signature)
+        try u32_be(out, header_and_table + offset)
+        try u32_be(out, size)
+    try out.put(tags.view())
+
+## The ICC profile of a built-in space, appended to `out`: "sRGB", "Display P3" or
+## "Rec. 2020" (the sRGB curve, but Rec. 2020's own for Rec. 2020), D65 white.
+pub func write_named_profile(out: Buffer*, name: str) -> !:
+    var primaries = primaries_rec709
+    var curve = srgb_transfer_function
+    if name == "Display P3":
+        primaries = primaries_smpte_eg_432_1
+    elif name == "Rec. 2020":
+        primaries = primaries_rec2020
+        curve = tf_rec2020
+    elif name != "sRGB":
+        error(invalid_profile, "the built-in profiles are sRGB, Display P3 and Rec. 2020")
+    let m = primaries.to_xyzd50() else error(invalid_profile, "the primaries have no matrix")
+    try write_profile(out, name, &curve, &m, primaries.wx, primaries.wy)
+
+func zeros(out: Buffer*, count: usize) -> !:
+    for _at in 0..<count:
+        try out.put_byte(0)
+
+func u32_be(out: Buffer*, value: u32) -> !:
+    try out.put_byte((u8)(value >> 24))
+    try out.put_byte((u8)(value >> 16))
+    try out.put_byte((u8)(value >> 8))
+    try out.put_byte((u8)value)
+
+func u16_be(out: Buffer*, value: u16) -> !:
+    try out.put_byte((u8)(value >> 8))
+    try out.put_byte((u8)value)
+
+## An s15Fixed16Number.
+func fixed(out: Buffer*, value: f32) -> !:
+    let scaled = (f64)value * 65536.0
+    let rounded = (i64)(scaled + 0.5) if scaled >= 0.0 else -(i64)(-scaled + 0.5)
+    try u32_be(out, (u32)(i32)rounded)
+
+func xyz_tag(out: Buffer*, x: f32, y: f32, z: f32) -> !:
+    try out.put(b"XYZ ")
+    try zeros(out, 4)
+    try fixed(out, x)
+    try fixed(out, y)
+    try fixed(out, z)
+
+## A parametric curve: type 3 (g, a, b, c, d) or type 4 (and e, f) when it needs them.
+func para(out: Buffer*, curve: const TransferFunction*) -> !:
+    try out.put(b"para")
+    try zeros(out, 4)
+    let full = curve.e != 0.0 or curve.f != 0.0
+    try u16_be(out, 4 if full else 3)
+    try zeros(out, 2)
+    for value in [curve.g, curve.a, curve.b, curve.c, curve.d]:
+        try fixed(out, value)
+    if full:
+        try fixed(out, curve.e)
+        try fixed(out, curve.f)
+
+## A one-record multiLocalizedUnicode tag, en-US, the ASCII of `text` as UTF-16BE.
+func mluc(out: Buffer*, text: str) -> !:
+    try out.put(b"mluc")
+    try zeros(out, 4)
+    try u32_be(out, 1)
+    try u32_be(out, 12)
+    try out.put(b"enUS")
+    try u32_be(out, (u32)text.length * 2)
+    try u32_be(out, 28)
+    for byte in text.bytes:
+        try out.put_byte(0)
+        try out.put_byte(byte if byte < 128 else '?')
