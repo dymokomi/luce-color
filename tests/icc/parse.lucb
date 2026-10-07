@@ -3,7 +3,7 @@
 #   tests/icc/parse - reading profiles: tags, curves, lookup tables and refusals
 #
 #   DESCRIPTION:
-#       What each fixture holds is checked in full against skcms by tests/run.py (the
+#       What each fixture holds is checked in full against skcms by tests/icc_oracle (the
 #       icc_tool dump against expected.txt); these tests read the parts by name.
 #
 #==============================================================================================

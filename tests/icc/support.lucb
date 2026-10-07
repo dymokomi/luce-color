@@ -4,7 +4,7 @@
 #
 #   DESCRIPTION:
 #       The profiles live in tests/fixtures/icc (see NOTICE there); `luce-base test` runs
-#       from the repository root (tests/run.py). The exact values the tests expect were
+#       from the repository root (luc test). The exact values the tests expect were
 #       printed by skcms itself (luce-browser-tools/oracles/luce-color/icc), built portable
 #       and without contraction, which this port follows to the bit.
 #

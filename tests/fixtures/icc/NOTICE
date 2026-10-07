@@ -1,4 +1,4 @@
-ICC profiles of the icc module's tests (tests/icc, and tests/run.py's oracle comparisons).
+ICC profiles of the icc module's tests (tests/icc, and tests/icc_oracle's comparisons).
 
 Written by tests/make_icc_fixtures.py (no third-party data):
   bad-*.icc, curv-gamma.icc, gray-ktrc.icc, identity-tables.icc, mab-xyz.icc, mft1-cmyk.icc,

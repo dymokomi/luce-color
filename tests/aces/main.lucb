@@ -49,6 +49,12 @@ func index_of(keys: const str[], key: str) -> i64:
     return -1
 
 pub func main(arguments: str[]) -> i32!:
+    # run by luc test from the package root with no arguments: the checked-in fixtures
+    var defaults: str[3] = ["", "tests/fixtures/aces/reference.txt", "tests/fixtures/aces/inverse.txt"]
+    let given = arguments if arguments.length > 1 else defaults[..<3]
+    return try check(given)
+
+func check(arguments: const str[]) -> i32!:
     let name = try strings.copy(arguments[1])
     defer strings.release(name)
     let text = try files.read((c.str)name)

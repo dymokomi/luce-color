@@ -56,7 +56,7 @@ the limiting primaries, where 1.0 is 100 cd/m² (an SDR display's white is 1.0, 
 1000-nit display's is 10.0), clamped to the peak. `to_xyz()` converts that RGB to
 CIE XYZ. Encoding for the display is the caller's job, through `space` and
 `transfer`. The transform follows the Academy's aces-output and OpenColorIO's ACES2
-implementation (reference only), in f64. `tests/aces_check.lucb` compares it with
+implementation (reference only), in f64. `tests/aces` compares it with
 OpenColorIO 2.6's builtins (SDR Rec.709, SDR P3-D65, 1000-nit P3-D65 and Rec.2020)
 on 447 colors each. The largest difference is 1.5e-5 of the peak.
 `tests/make_aces_fixtures.py` regenerates the reference from OpenColorIO.
@@ -78,7 +78,7 @@ that close to the display color.
 `icc` is a faithful port of skcms, the ICC library Skia (and so Chrome, Android and Ladybird)
 uses, with the parts of Skia that make a profile into the color space an image is drawn in.
 It computes in f32 in skcms's order without fused multiply-adds, so its results are skcms's
-built portable without contraction, to the bit: `tests/run.py` holds every profile of
+built portable without contraction, to the bit: `tests/icc_oracle` holds every profile of
 `tests/fixtures/icc` against skcms's own dump of it, and against Skia's color spaces.
 
 ```luce
@@ -149,7 +149,7 @@ then run the module's test blocks in every compiled mode:
 ```sh
 (cd ../luce-base && ./build.sh)
 (cd ../luce && LUCE_BASE_COMPILER=../luce-base/build/luce-base ./build.sh)
-./test.sh
+luc test
 ```
 
 Licensed under either of Apache-2.0 or MIT at your option.

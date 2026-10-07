@@ -1,0 +1,12 @@
+#prisma 4.0
+def package "icc_oracle" {
+    def dependency "luce-std" {
+        str owner = "dymokomi"
+        str path = "../../../luce-std"
+    }
+
+    def dependency "luce-crypto" {
+        str owner = "dymokomi"
+        str path = "../../../luce-crypto"
+    }
+}

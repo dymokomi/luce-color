@@ -15,7 +15,7 @@ by a plain Python writer so they carry no third-party data.
 - bad-*.icc: profiles skcms refuses (signature, illuminant, tag past the end, version 5,
   a para curve with a = 0 or one whose d = -b/a is negative, a CLUT with one grid point)
 
-The expected dumps (expected.txt) come from the skcms oracle, see run.py.
+The expected dumps (expected.txt) come from the skcms oracle, see tests/icc_oracle.
 """
 import math
 import struct

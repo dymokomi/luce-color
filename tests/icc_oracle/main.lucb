@@ -1,0 +1,101 @@
+## The icc module against skcms and Skia: tests/icc_tool, built here, must print for every
+## profile of tests/fixtures/icc skcms's dump (expected.txt) and Skia's color spaces
+## (spaces.txt) byte for byte, and its pixel-format sweep of each profile listed in
+## formats.sha256 must hash as skcms's does. Run from the package root by luc test.
+import c
+import interop
+import io
+import memory
+import os
+import strings
+from luce_std import files, process
+from luce_crypto import native as crypto
+
+let failed: ErrorCode = ErrorCode.package(1)
+let fixtures = "tests/fixtures/icc"
+let tool = "build/tests/icc_oracle/icc_tool"
+
+pub func main(arguments: str[]) -> i32!:
+    _ = arguments
+    let base = os.env("LUCE_BASE") else "luce-base"
+    var build: c.str[5] = ["build", "tests/icc_tool/icc_tool.lucb", "--native", "-o", (c.str)tool]
+    let built = try process.run((c.str)base, build[..<5])
+    defer built.release()
+    if built.value.exit_code != 0:
+        try io.stderr().write(built.value.error_output)
+        error(failed, "the icc tool does not build")
+    let listing = try files.list((c.str)fixtures)
+    defer listing.release()
+    var count: usize = 0
+    for name in listing.value:
+        if strings.ends_with(name, ".icc"): count += 1
+    # the tool's arguments: an optional mode, then every profile, sorted as the listing is
+    let words = try new c.str[count + 1] --- in memory.heap
+    defer free(words) in memory.heap
+    words[0] = "--spaces"
+    var at: usize = 1
+    for name in listing.value:
+        if strings.ends_with(name, ".icc"):
+            words[at] = (c.str)name
+            at += 1
+    try same(words[1..], "expected.txt", "the dump differs from skcms's (tests/fixtures/icc/expected.txt)")
+    try same(words, "spaces.txt", "the color spaces differ from Skia's (tests/fixtures/icc/spaces.txt)")
+    try sweeps()
+    print(f"ok icc dumps and color spaces of {count} profiles, and the format sweeps")
+    return 0
+
+## The tool's output with `words`, run beside the profiles; the caller releases it.
+func output_of(words: const c.str[]) -> interop.Owned[process.Completed]!:
+    var path: u8[512]
+    let absolute = try strings.format(path[..<511], f"../../../{tool}")
+    path[absolute.length] = 0
+    let ran = try process.run((c.str)&path[0], words, (c.str)fixtures)
+    if ran.value.exit_code != 0:
+        try io.stderr().write(ran.value.error_output)
+        ran.release()
+        error(failed, "the icc tool failed")
+    return ran
+
+## Fail with `message` unless the tool's output with `words` is the fixture `name`.
+func same(words: const c.str[], name: str, message: str) -> !:
+    let ran = try output_of(words)
+    defer ran.release()
+    var path: u8[512]
+    let joined = try strings.format(path[..<511], f"{fixtures}/{name}")
+    path[joined.length] = 0
+    let wanted = try files.read((c.str)&path[0])
+    defer wanted.release()
+    if (str)wanted.value != ran.value.output: error(failed, message)
+
+## Each `hash  profile` line of formats.sha256: the sweep of that profile hashes so.
+func sweeps() -> !:
+    var path: u8[512]
+    let joined = try strings.format(path[..<511], f"{fixtures}/formats.sha256")
+    path[joined.length] = 0
+    let listed = try files.read((c.str)&path[0])
+    defer listed.release()
+    let text = (str)listed.value
+    var start: usize = 0
+    while start < text.length:
+        let end = strings.find_from(text, "\n", start) else text.length
+        let line = (str)text.bytes[start..<end]
+        start = end + 1
+        let (hash, profile) = strings.split_once(line, "  ") else continue
+        let name = try strings.copy(profile)
+        defer strings.release(name)
+        var words: c.str[2] = ["--formats", (c.str)name]
+        let ran = try output_of(words[..<2])
+        defer ran.release()
+        var digest: u8[32]
+        _ = try crypto.digest(ran.value.output.bytes, digest[..<32])
+        if not try hex_is(digest[..<32], hash):
+            print(f"the format sweep of {profile} differs from skcms's")
+            error(failed, "a format sweep differs from skcms's")
+
+func hex_is(digest: const u8[], hex_text: str) -> bool!:
+    let digits = b"0123456789abcdef"
+    if hex_text.length != digest.length * 2: return false
+    for i in 0..<digest.length:
+        if hex_text.bytes[i * 2] != digits[(usize)(digest[i] >> 4)]: return false
+        if hex_text.bytes[i * 2 + 1] != digits[(usize)(digest[i] & 15)]: return false
+    return true
