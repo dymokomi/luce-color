@@ -14,6 +14,8 @@ UI theme and a file codec agree about what a color is:
 | `oklab` | Oklab from XYZ, ΔEok, sRGB `max_chroma(l, h)`, CSS-style gamut mapping by chroma reduction (`to_srgb`), gamut-relative chroma for pickers |
 | `hsl` | HSV (Photoshop's HSB) and HSL over encoded RGB, for pickers |
 | `space` | `ColorSpace` = name + primaries + transfer, as OpenColorIO models one; a catalogue (`space.all`, `space.named`); `convert(color, from, to)` — decode, matrix, adapt, matrix, encode — plus `to_lab`, `to_oklab_in`, `to_appearance`, `in_gamut`, `clamp` |
+| `temperature` | correlated color temperature and tint (Robertson, with the DNG SDK's tint scale): `white(kelvin, tint)` and `of(chromaticity)` |
+| `spectral` | spectra at 5 nm over 380–780 nm, the CIE 1931 observer, black-body light, and spectral upsampling (Jakob & Hanika's sigmoid spectra): `fit` one color, `Upsampler` a grid over xy |
 | `aces` | the ACES 2.0 Output Transform: Hellwig 2022 JMh, the Daniele tonescale, chroma compression and gamut compression into a display's limiting gamut, for SDR and HDR peaks, and its inverse; matches OpenColorIO's builtin transforms within 1e-4 of the peak |
 | `icc` | ICC profiles, a port of skcms (Skia's ICC library): `parse` (v2 and v4, matrix/TRC, A2B/B2A lookup tables, cicp), transfer functions and curve fitting, `transform` between profiles and pixel formats; Skia's `ColorSpace` (from a profile, CICP code points or named primaries and curves) and the `Steps` between two of them |
 
@@ -112,6 +114,31 @@ let p3 = icc.ColorSpace.cicp(12, 13)
 | `transfer_function(t)`, `primaries_matrix(p)`, `ColorSpace.from_space(s)` | This library's `transfer`, `xyz` and `space` types in skcms's terms. |
 
 skcms and Skia are BSD-3-Clause (LICENSE-skia); the port keeps their notices.
+
+## Spectra (`spectral`)
+
+Something with its own spectral response, a film emulsion or a camera, needs a
+spectrum for a color, not three numbers. `spectral` samples spectra every 5 nm
+from 380 to 780 nm, turns them into XYZ with the CIE 1931 2° observer, and
+makes black-body light (`planck`, scaled to Y = 1). A color's spectrum comes
+from Jakob & Hanika's model ("A Low-Dimensional Function Space for Efficient
+Spectral Upsampling", 2019): a sigmoid of a quadratic in wavelength, three
+coefficients fitted by Gauss–Newton in CIELAB. `fit(target, light)` fits a
+surface for one color under a light; `upsampler(light, size)` fits a grid over
+CIE xy, from the white outward, each cell's spectrum lit and scaled to Y = 1, so
+any color's spectrum is its cell's times its luminance. Chromaticities beyond
+the spectral locus take the nearest color toward the white a surface can show.
+A 48 × 48 grid fits in about 0.1 s.
+
+```luce
+from luce_color import spectral
+
+let tungsten = spectral.planck(3200.0)
+var grid = try spectral.upsampler(tungsten, 48)
+defer grid.release()
+let skin = grid.spectrum(30, 22)     # light at that cell's chromaticity, Y = 1
+let exposure = skin.dot(response)   # through a sensor's f64[81] response
+```
 
 ## Theme derivations (`color`)
 

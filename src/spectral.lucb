@@ -1,0 +1,344 @@
+## Spectra: light and surfaces sampled across the visible range, the CIE 1931
+## standard observer that turns them into XYZ, black-body light, and spectral
+## upsampling, which finds a plausible smooth spectrum for a color so that
+## something with its own spectral response (a film emulsion, a camera) can be
+## exposed to it. The upsampling follows Jakob & Hanika, "A Low-Dimensional
+## Function Space for Efficient Spectral Upsampling" (2019): a spectrum is a
+## sigmoid of a quadratic in wavelength, three coefficients fitted to the color.
+from luce_std import math
+import memory
+from xyz import XYZ, Chromaticity
+
+# mark: Sampling ==============================================================
+
+## Spectra are sampled every 5 nm from 380 nm to 780 nm.
+pub let samples: usize = 81
+pub let first_nm: f64 = 380.0
+pub let step_nm: f64 = 5.0
+
+## Sample `at`'s wavelength in nm.
+pub func wavelength(at: usize) -> f64:
+    return first_nm + step_nm * (f64)at
+
+## A spectrum: spectral power (light) or reflectance (a surface) per sample.
+pub struct Spectrum:
+    pub var values: f64[81]
+
+    ## The XYZ of light with this spectrum: the observer's sums. A spectrum from
+    ## `planck` or `Upsampler` has Y = 1.
+    pub func xyz() -> XYZ:
+        var out = XYZ(0.0, 0.0, 0.0)
+        for at in 0..<samples:
+            out.x += self.values[at] * observer[at * 3]
+            out.y += self.values[at] * observer[at * 3 + 1]
+            out.z += self.values[at] * observer[at * 3 + 2]
+        return out
+
+    ## The sum of this spectrum times `response`, sample by sample: how strongly
+    ## a sensor with that spectral response is exposed to it.
+    pub func dot(response: const f64[81]) -> f64:
+        var sum = 0.0
+        for at in 0..<samples:
+            sum += self.values[at] * response[at]
+        return sum
+
+## The CIE 1931 2° standard observer's color-matching functions x̄, ȳ, z̄,
+## interleaved, at the samples (CIE 15:2004, 5 nm).
+pub let observer: f64[243] = [
+    0.001368, 0.000039, 0.00645, 0.002236, 0.000064, 0.01055, 0.004243, 0.00012, 0.02005, 0.00765, 0.000217, 0.03621,
+    0.01431, 0.000396, 0.06785, 0.02319, 0.00064, 0.1102, 0.04351, 0.00121, 0.2074, 0.07763, 0.00218, 0.3713,
+    0.13438, 0.004, 0.6456, 0.21477, 0.0073, 1.0390501, 0.2839, 0.0116, 1.3856, 0.3285, 0.01684, 1.62296,
+    0.34828, 0.023, 1.74706, 0.34806, 0.0298, 1.7826, 0.3362, 0.038, 1.77211, 0.3187, 0.048, 1.7441,
+    0.2908, 0.06, 1.6692, 0.2511, 0.0739, 1.5281, 0.19536, 0.09098, 1.28764, 0.1421, 0.1126, 1.0419,
+    0.09564, 0.13902, 0.8129501, 0.05795, 0.1693, 0.6162, 0.03201, 0.20802, 0.46518, 0.0147, 0.2586, 0.3533,
+    0.0049, 0.323, 0.272, 0.0024, 0.4073, 0.2123, 0.0093, 0.503, 0.1582, 0.0291, 0.6082, 0.1117,
+    0.06327, 0.71, 0.07825, 0.1096, 0.7932, 0.05725, 0.1655, 0.862, 0.04216, 0.2257499, 0.9148501, 0.02984,
+    0.2904, 0.954, 0.0203, 0.3597, 0.9803, 0.0134, 0.4334499, 0.9949501, 0.00875, 0.5120501, 1.0, 0.00575,
+    0.5945, 0.995, 0.0039, 0.6784, 0.9786, 0.00275, 0.7621, 0.952, 0.0021, 0.8425, 0.9154, 0.0018,
+    0.9163, 0.87, 0.00165, 0.9786, 0.8163, 0.0014, 1.0263, 0.757, 0.0011, 1.0567, 0.6949, 0.001,
+    1.0622, 0.631, 0.0008, 1.0456, 0.5668, 0.0006, 1.0026, 0.503, 0.00034, 0.9384, 0.4412, 0.00024,
+    0.8544499, 0.381, 0.00019, 0.7514, 0.321, 0.0001, 0.6424, 0.265, 0.00005, 0.5419, 0.217, 0.00003,
+    0.4479, 0.175, 0.00002, 0.3608, 0.1382, 0.00001, 0.2835, 0.107, 0.0, 0.2187, 0.0816, 0.0,
+    0.1649, 0.061, 0.0, 0.1212, 0.04458, 0.0, 0.0874, 0.032, 0.0, 0.0636, 0.0232, 0.0,
+    0.04677, 0.017, 0.0, 0.0329, 0.01192, 0.0, 0.0227, 0.00821, 0.0, 0.01584, 0.005723, 0.0,
+    0.0113592, 0.004102, 0.0, 0.0081109, 0.002929, 0.0, 0.0057903, 0.002091, 0.0, 0.0041095, 0.001484, 0.0,
+    0.0028993, 0.001047, 0.0, 0.0020492, 0.00074, 0.0, 0.00144, 0.00052, 0.0, 0.0009999, 0.0003611, 0.0,
+    0.0006901, 0.0002492, 0.0, 0.000476, 0.0001719, 0.0, 0.0003323, 0.00012, 0.0, 0.0002348, 0.0000848, 0.0,
+    0.0001662, 0.00006, 0.0, 0.0001174, 0.0000424, 0.0, 0.0000831, 0.00003, 0.0, 0.0000587, 0.0000212, 0.0,
+    0.0000415, 0.000015, 0.0]
+
+# mark: Light =================================================================
+
+## Black-body (Planckian) light at `kelvin`, scaled to Y = 1.
+pub func planck(kelvin: f64) -> Spectrum:
+    var out: Spectrum
+    for at in 0..<samples:
+        let metres = wavelength(at) * 1.0e-9
+        out.values[at] = 1.0 / (metres * metres * metres * metres * metres * (math.exp(1.4387769e-2 / (metres * kelvin)) - 1.0))
+    let y = out.xyz().y
+    for at in 0..<samples:
+        out.values[at] /= y
+    return out
+
+# mark: Sigmoid spectra =======================================================
+
+## A smooth spectrum in 0..1: s(λ) = ½ + x / (2√(1 + x²)) with x = c0·t² + c1·t + c2
+## over t = (λ − 380 nm) / 400 nm. All zeros is a flat 50%.
+pub struct Sigmoid:
+    pub var c0: f64
+    pub var c1: f64
+    pub var c2: f64
+
+    ## The value at sample `at`.
+    pub func at(at: usize) -> f64:
+        let t = ((f64)at * step_nm) / 400.0
+        let x = (self.c0 * t + self.c1) * t + self.c2
+        return 0.5 + x / (2.0 * math.sqrt(1.0 + x * x))
+
+    ## The spectrum of a surface with this reflectance lit by `light`.
+    pub func lit(light: const Spectrum*) -> Spectrum:
+        var out: Spectrum
+        for at in 0..<samples:
+            out.values[at] = light.values[at] * self.at(at)
+        return out
+
+## CIELAB of `value` against `white` (both under the same light).
+func lab_of(value: XYZ, white: XYZ) -> f64[3]:
+    let fx = lab_f(value.x / white.x)
+    let fy = lab_f(value.y / white.y)
+    let fz = lab_f(value.z / white.z)
+    return [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+
+func lab_f(t: f64) -> f64:
+    return math.cbrt(t) if t > 216.0 / 24389.0 else (24389.0 / 27.0 * t + 16.0) / 116.0
+
+## The sigmoid whose surface, lit by `light`, has the color `target` (XYZ under
+## that light, its white at Y = 1), by Gauss–Newton in CIELAB from `start`; with
+## the largest CIELAB error left. A color outside what any reflectance can show
+## under `light` leaves a large error.
+pub func fit(target: XYZ, light: const Spectrum*, start: Sigmoid = Sigmoid(0.0, 0.0, 0.0)) -> (Sigmoid, f64):
+    let white = light.xyz()
+    let goal = lab_of(target, white)
+    var c: f64[3] = [start.c0, start.c1, start.c2]
+    var worst = 0.0
+    for _ in 0..<40:
+        let here = lab_of(Sigmoid(c[0], c[1], c[2]).lit(light).xyz(), white)
+        var residual: f64[3] = [here[0] - goal[0], here[1] - goal[1], here[2] - goal[2]]
+        worst = math.max(math.abs(residual[0]), math.max(math.abs(residual[1]), math.abs(residual[2])))
+        if worst < 1.0e-3:
+            break
+        # The Jacobian by forward differences, column by column.
+        var jacobian: f64[9]
+        for k in 0..<(usize)3:
+            var nudged = c
+            nudged[k] += 1.0e-4
+            let moved = lab_of(Sigmoid(nudged[0], nudged[1], nudged[2]).lit(light).xyz(), white)
+            for row in 0..<(usize)3:
+                jacobian[row * 3 + k] = (moved[row] - here[row]) / 1.0e-4
+        var step = solve3(jacobian, residual) else return (Sigmoid(c[0], c[1], c[2]), 1.0e9)
+        # Damped, so a near-singular step cannot fling the coefficients away.
+        let largest = math.max(math.abs(step[0]), math.max(math.abs(step[1]), math.abs(step[2])))
+        if largest > 50.0:
+            for k in 0..<(usize)3:
+                step[k] *= 50.0 / largest
+        for k in 0..<(usize)3:
+            c[k] -= step[k]
+    return (Sigmoid(c[0], c[1], c[2]), worst)
+
+## The solution of the 3×3 system `m`·x = `v` (row-major), or none when singular.
+func solve3(m: f64[9], v: f64[3]) -> f64[3]?:
+    let det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6])
+    if math.abs(det) < 1.0e-14:
+        return none
+    var out: f64[3]
+    out[0] = (v[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (v[1] * m[8] - m[5] * v[2]) + m[2] * (v[1] * m[7] - m[4] * v[2])) / det
+    out[1] = (m[0] * (v[1] * m[8] - m[5] * v[2]) - v[0] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * v[2] - v[1] * m[6])) / det
+    out[2] = (m[0] * (m[4] * v[2] - v[1] * m[7]) - m[1] * (m[3] * v[2] - v[1] * m[6]) + v[0] * (m[3] * m[7] - m[4] * m[6])) / det
+    return out
+
+# mark: Upsampling ============================================================
+
+## A spectrum for every chromaticity, as light under `light`: a grid over CIE xy
+## (x 0..0.8, y 0..0.9) of sigmoid surfaces lit by it, each scaled to Y = 1, so a
+## color's spectrum is its cell's times its luminance. The white is `light`
+## itself. Chromaticities no surface can reach under the light (beyond the
+## spectral locus, or too close to it) take the nearest color toward the white
+## that one can.
+pub struct Upsampler:
+    pub var size: usize
+    pub var light: Spectrum
+    ## Per cell (x major): the sigmoid's three coefficients and its scale to Y = 1.
+    var cells: f64[]
+
+    ## Cell (`i`, `j`)'s spectrum, at Y = 1.
+    pub func spectrum(i: usize, j: usize) -> Spectrum:
+        let base = (i * self.size + j) * 4
+        var out = Sigmoid(self.cells[base], self.cells[base + 1], self.cells[base + 2]).lit(&self.light)
+        for at in 0..<samples:
+            out.values[at] *= self.cells[base + 3]
+        return out
+
+    ## The chromaticity at the center of cell (`i`, `j`).
+    pub func chromaticity(i: usize, j: usize) -> Chromaticity:
+        return Chromaticity((f64)i / (f64)(self.size - 1) * x_span, (f64)j / (f64)(self.size - 1) * y_span)
+
+    pub func release():
+        if self.cells.length > 0:
+            free(self.cells) in memory.heap
+        var none_left: f64[]
+        self.cells = none_left
+
+pub let x_span: f64 = 0.8
+pub let y_span: f64 = 0.9
+
+## Fit every cell of a `size` × `size` grid for `light`, from the white outward
+## so each fit starts from a fitted neighbour (`size` at least 4). The caller
+## releases it.
+pub func upsampler(light: Spectrum, size: usize) -> Upsampler!:
+    assert(size >= 4)
+    var out = Upsampler(size = size, light = light)
+    out.cells = try new f64[size * size * 4] --- in memory.heap
+    errdefer out.release()
+    let fitted = try new bool[size * size] in memory.heap
+    defer free(fitted) in memory.heap
+    for at in 0..<fitted.length:
+        fitted[at] = false
+    let white = light.xyz()
+    let wx = white.x / (white.x + white.y + white.z)
+    let wy = white.y / (white.x + white.y + white.z)
+    # Cells in order of distance from the white.
+    let order = try new usize[size * size] in memory.heap
+    defer free(order) in memory.heap
+    let distance = try new f64[size * size] in memory.heap
+    defer free(distance) in memory.heap
+    for at in 0..<order.length:
+        order[at] = at
+        let point = out.chromaticity(at // size, at % size)
+        distance[at] = (point.x - wx) * (point.x - wx) + (point.y - wy) * (point.y - wy)
+    sort_by(order, distance)
+    for cell in order:
+        let i = cell // size
+        let j = cell % size
+        let point = out.chromaticity(i, j)
+        let start = nearest_fitted(&out, fitted, i, j)
+        # Beyond the spectral locus (or just inside it) no surface reaches the
+        # color: start from where the line to the white crosses 0.95 of the way.
+        var pull = math.min(1.0, 0.95 * locus_reach(wx, wy, point.x, point.y))
+        var found = Sigmoid(0.0, 0.0, 0.0)
+        var done = false
+        while not done and pull > 0.0:
+            let px = wx + (point.x - wx) * pull
+            let py = wy + (point.y - wy) * pull
+            for lightness in [60.0, 35.0, 15.0, 5.0]:
+                let y = (lightness + 16.0) / 116.0
+                let luminance = y * y * y
+                let target = XYZ(px / py * luminance, luminance, (1.0 - px - py) / py * luminance)
+                let (sigmoid, miss) = fit(target, &light, start)
+                if miss < 0.05:
+                    found = sigmoid
+                    done = true
+                    break
+            pull -= 0.1
+        let lit = found.lit(&light)
+        let base = cell * 4
+        out.cells[base] = found.c0
+        out.cells[base + 1] = found.c1
+        out.cells[base + 2] = found.c2
+        out.cells[base + 3] = 1.0 / lit.xyz().y
+        fitted[cell] = true
+    return out
+
+## How far along the line from the white (`wx`, `wy`) toward (`x`, `y`) the
+## spectral locus (monochromatic light, 380–700 nm, closed by the line of
+## purples) lies, as a fraction of the way to (`x`, `y`): above 1 inside.
+func locus_reach(wx: f64, wy: f64, x: f64, y: f64) -> f64:
+    var nearest = 1.0e9
+    let dx = x - wx
+    let dy = y - wy
+    # Monochromatic samples up to 700 nm (beyond, the locus barely moves).
+    let last = 64
+    for at in 0..<last + 1:
+        let next = (at + 1) % (last + 1)
+        let (ax, ay) = monochromatic((usize)at)
+        let (bx, by) = monochromatic((usize)next)
+        # Solve white + t·d = a + s·(b − a) for t ≥ 0 and s in 0..1.
+        let ex = bx - ax
+        let ey = by - ay
+        let det = dx * ey - dy * ex
+        if math.abs(det) < 1.0e-14:
+            continue
+        let t = ((ax - wx) * ey - (ay - wy) * ex) / det
+        let s = ((ax - wx) * dy - (ay - wy) * dx) / det
+        if t > 0.0 and s >= 0.0 and s <= 1.0:
+            nearest = math.min(nearest, t)
+    return nearest
+
+func monochromatic(at: usize) -> (f64, f64):
+    let total = observer[at * 3] + observer[at * 3 + 1] + observer[at * 3 + 2]
+    return (observer[at * 3] / total, observer[at * 3 + 1] / total)
+
+## The coefficients of a fitted neighbour of (`i`, `j`), or zeros.
+func nearest_fitted(grid: const Upsampler*, fitted: const bool[], i: usize, j: usize) -> Sigmoid:
+    let n = grid.size
+    for (di, dj) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)]:
+        let ni = (i64)i + di
+        let nj = (i64)j + dj
+        if ni >= 0 and nj >= 0 and ni < (i64)n and nj < (i64)n and fitted[(usize)ni * n + (usize)nj]:
+            let base = ((usize)ni * n + (usize)nj) * 4
+            return Sigmoid(grid.cells[base], grid.cells[base + 1], grid.cells[base + 2])
+    return Sigmoid(0.0, 0.0, 0.0)
+
+## Sort `order` by `key[order[...]]`, ascending (insertion sort over runs; the
+## grid is small).
+func sort_by(order: usize[], key: const f64[]):
+    # Shell sort with Ciura's gaps.
+    for gap in [701, 301, 132, 57, 23, 10, 4, 1]:
+        let g = (usize)gap
+        if g >= order.length:
+            continue
+        for at in g..<order.length:
+            let held = order[at]
+            var back = at
+            while back >= g and key[order[back - g]] > key[held]:
+                order[back] = order[back - g]
+                back -= g
+            order[back] = held
+
+# mark: Tests =================================================================
+
+test "the observer integrates equal-energy light to equal XYZ":
+    var flat: Spectrum
+    for at in 0..<samples:
+        flat.values[at] = 1.0
+    let value = flat.xyz()
+    assert(math.abs(value.x / value.y - 1.0) < 0.01 and math.abs(value.z / value.y - 1.0) < 0.01)
+
+test "a 6504 K black body is near D65":
+    let light = planck(6504.0)
+    let value = light.xyz()
+    let x = value.x / (value.x + value.y + value.z)
+    let y = value.y / (value.x + value.y + value.z)
+    assert(math.abs(value.y - 1.0) < 1.0e-9)
+    assert(math.abs(x - 0.3135) < 0.002 and math.abs(y - 0.3236) < 0.002)
+
+test "a fit reproduces a skin tone under tungsten light":
+    let light = planck(3200.0)
+    let white = light.xyz()
+    # A light skin: Lab about (65, 15, 18) under the light, as XYZ.
+    let fy = (65.0 + 16.0) / 116.0
+    let fx = fy + 15.0 / 500.0
+    let fz = fy - 18.0 / 200.0
+    let target = XYZ(fx * fx * fx * white.x, fy * fy * fy, fz * fz * fz * white.z)
+    let (sigmoid, miss) = fit(target, &light)
+    assert(miss < 0.01)
+    let shown = sigmoid.lit(&light).xyz()
+    assert(math.abs(shown.y - target.y) < 1.0e-3)
+
+test "every upsampler cell has Y = 1 and the white cell is near flat":
+    var grid = upsampler(planck(3200.0), 16) catch failure:
+        assert(false)
+        return
+    defer grid.release()
+    for i in 0..<(usize)16:
+        for j in 0..<(usize)16:
+            assert(math.abs(grid.spectrum(i, j).xyz().y - 1.0) < 1.0e-6)
