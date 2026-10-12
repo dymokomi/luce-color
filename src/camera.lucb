@@ -1,0 +1,291 @@
+## Cameras as spectral instruments: how strongly each of a camera's three
+## channels responds to light at each wavelength (its spectral sensitivities),
+## so that what a camera recorded can be turned into what something else with
+## its own spectral response, such as a film emulsion, would have recorded of
+## the same scene.
+##
+## Measured curves come from the Academy's rawtoaces-data (Apache-2.0; 52
+## cameras, most measured by Weta Digital in 2025–26; camera_data.lucb, made by
+## tools/cameras.py). For any other camera, `estimate` finds plausible curves
+## from what every raw file carries: its color matrices, which say how the
+## camera responds to colors under one or two lights. The curves are fitted in
+## a prior over the measured cameras (each channel's mean shape and its first
+## principal components, gains free), following Solomatov and Akkaynak,
+## "Spectral Sensitivity Estimation Without a Camera" (ICCP 2023): about 10% of
+## the peak off a measured curve, about what two labs measuring one camera
+## disagree by. The fit's data are the 190 training reflectances rawtoaces fits
+## its matrices to, also here for anyone fitting a mapping from camera values.
+from luce_std import math
+import xyz
+from xyz import XYZ
+import spectral
+from spectral import Spectrum, samples
+import camera_data
+
+## A camera's red, green and blue spectral sensitivities, 81 samples each (380
+## to 780 nm every 5 nm), red first.
+pub struct Response:
+    pub var curves: f64[243]
+
+    ## The camera's three values for light `spectrum`.
+    pub func of(spectrum: const Spectrum*) -> f64[3]:
+        var out: f64[3] = [0.0, 0.0, 0.0]
+        for channel in 0..<(usize)3:
+            for at in 0..<samples:
+                out[channel] += spectrum.values[at] * self.curves[channel * 81 + at]
+        return out
+
+    ## Each channel scaled by `gains`: the same camera with its values
+    ## multiplied, as a white balance multiplies them.
+    pub func scaled(gains: f64[3]) -> Response:
+        var out = Response(curves = self.curves)
+        for channel in 0..<(usize)3:
+            for at in 0..<samples:
+                out.curves[channel * 81 + at] *= gains[channel]
+        return out
+
+## The CIE 1931 standard observer as a camera: its values are XYZ.
+pub func observer() -> Response:
+    var out: Response
+    for channel in 0..<(usize)3:
+        for at in 0..<samples:
+            out.curves[channel * 81 + at] = spectral.observer[at * 3 + channel]
+    return out
+
+## The measured curves of camera `make` `model` as raw files name it (EXIF's
+## Make and Model), or none. Names are compared ignoring case, spaces, hyphens,
+## the maker repeated in the model and the maker's company suffix, with "Mark
+## II" and "M2" the same.
+pub func measured(make: str, model: str) -> Response?:
+    var wanted: u8[64]
+    let length = key(make, model, &wanted)
+    for at in 0..<camera_data.measured_count:
+        var here: u8[64]
+        let n = key(camera_data.measured_makes[at], camera_data.measured_models[at], &here)
+        if n != length:
+            continue
+        var same = true
+        for k in 0..<n:
+            same = same and here[k] == wanted[k]
+        if same:
+            var out: Response
+            for k in 0..<(usize)243:
+                out.curves[k] = camera_data.measured_curves[at * 243 + k]
+            return out
+    return none
+
+## A matching key for `make` and `model` into `out`: the maker's first word,
+## then the model's letters and digits without the maker's name, lower case,
+## "markii" as "m2" (to "markiv" as "m4"). Its length.
+func key(make: str, model: str, out: u8[64]*) -> usize:
+    var n: usize = 0
+    let maker = make.bytes
+    for b in maker:
+        if b == ' ' or n >= 16:
+            break
+        (*out)[n] = lower(b)
+        n += 1
+    let start = n
+    let bytes = model.bytes
+    var at: usize = 0
+    while at < bytes.length and n < 64:
+        let b = lower(bytes[at])
+        if (b >= 'a' and b <= 'z') or (b >= '0' and b <= '9'):
+            (*out)[n] = b
+            n += 1
+        at += 1
+    # The model repeating the maker ("NIKON D850", "Canon EOS R5"): drop it.
+    if n - start >= start and start > 0:
+        var repeats = true
+        for k in 0..<start:
+            repeats = repeats and (*out)[start + k] == (*out)[k]
+        if repeats:
+            for k in start..<n - start:
+                (*out)[k] = (*out)[k + start]
+            n -= start
+    # "markii" (and iii, iv) as "m2" (m3, m4).
+    for (long, short) in [("markiv", "m4"), ("markiii", "m3"), ("markii", "m2")]:
+        n = replace(out, n, long, short)
+    return n
+
+func lower(b: u8) -> u8:
+    return b | 32 if b >= 'A' and b <= 'Z' else b
+
+## `text` (first `n` bytes) with the first `long` replaced by `short`; its length.
+func replace(text: u8[64]*, n: usize, long: str, short: str) -> usize:
+    let a = long.bytes
+    let b = short.bytes
+    if n < a.length:
+        return n
+    for at in 0..<n - a.length + 1:
+        var here = true
+        for k in 0..<a.length:
+            here = here and (*text)[at + k] == a[k]
+        if here:
+            for k in 0..<b.length:
+                (*text)[at + k] = b[k]
+            for k in at + a.length..<n:
+                (*text)[k - a.length + b.length] = (*text)[k]
+            return n - a.length + b.length
+    return n
+
+## A camera's curves estimated from its color matrices: `to_camera`'s k-th nine
+## values, a matrix row major, take XYZ (its white at Y = 1) to the camera's raw values under light
+## `kelvins[k]` (as `spectral.illuminant` makes it). One matrix is enough; two, at
+## lights far apart (a DNG's A and D65), pin the curves down better. Each
+## channel is its mean shape and principal components, with free weights,
+## fitted so the training reflectances under each light give the values the
+## matrix says, the components' weights held back a little (ridge) so the
+## curves stay camera-like; negative samples are cut to zero.
+pub func estimate(to_camera: const f64[], kelvins: const f64[]) -> Response:
+    let n = camera_data.basis_size
+    var out: Response
+    for channel in 0..<(usize)3:
+        # Normal equations of the least squares, n × n, accumulated.
+        var normal: f64[16]
+        var right: f64[4]
+        for k in 0..<(usize)16:
+            normal[k] = 0.0
+        for k in 0..<(usize)4:
+            right[k] = 0.0
+        var column_norm = 0.0
+        for light_at in 0..<kelvins.length:
+            let light = spectral.illuminant(kelvins[light_at])
+            let m = to_camera[light_at * 9..<light_at * 9 + 9]
+            for patch in 0..<camera_data.training_count:
+                var lit: Spectrum
+                for at in 0..<samples:
+                    lit.values[at] = light.values[at] * camera_data.training[patch * 81 + at]
+                let seen = lit.xyz()
+                let target = m[channel * 3] * seen.x + m[channel * 3 + 1] * seen.y + m[channel * 3 + 2] * seen.z
+                var row: f64[4]
+                for j in 0..<n:
+                    row[j] = lit.dot(basis_row(channel, j))
+                for a in 0..<n:
+                    for b in 0..<n:
+                        normal[a * 4 + b] += row[a] * row[b]
+                    right[a] += row[a] * target
+        for a in 0..<n:
+            column_norm += math.sqrt(normal[a * 4 + a])
+        column_norm /= (f64)n
+        # Ridge on the components (not the mean shape's weight).
+        for j in 1..<n:
+            normal[j * 4 + j] += 1.0e-3 * column_norm * column_norm
+        let weights = solve(normal, right, n)
+        for at in 0..<samples:
+            var value = 0.0
+            for j in 0..<n:
+                value += weights[j] * camera_data.basis[(channel * n + j) * 81 + at]
+            out.curves[channel * 81 + at] = math.max(value, 0.0)
+    return out
+
+## Basis vector `j` (0 the mean shape) of channel `channel`, as a response.
+func basis_row(channel: usize, j: usize) -> f64[81]:
+    var out: f64[81]
+    let first = (channel * camera_data.basis_size + j) * 81
+    for at in 0..<samples:
+        out[at] = camera_data.basis[first + at]
+    return out
+
+## The solution of the `n` × `n` system (row stride 4) by Gaussian elimination
+## with partial pivoting; zeros where it is singular.
+func solve(m: f64[16], v: f64[4], n: usize) -> f64[4]:
+    var a = m
+    var b = v
+    for col in 0..<n:
+        var pivot = col
+        for row in col + 1..<n:
+            if math.abs(a[row * 4 + col]) > math.abs(a[pivot * 4 + col]):
+                pivot = row
+        if math.abs(a[pivot * 4 + col]) < 1.0e-300:
+            return [0.0, 0.0, 0.0, 0.0]
+        if pivot != col:
+            for k in 0..<n:
+                let held = a[col * 4 + k]
+                a[col * 4 + k] = a[pivot * 4 + k]
+                a[pivot * 4 + k] = held
+            let held = b[col]
+            b[col] = b[pivot]
+            b[pivot] = held
+        for row in col + 1..<n:
+            let f = a[row * 4 + col] / a[col * 4 + col]
+            for k in col..<n:
+                a[row * 4 + k] -= f * a[col * 4 + k]
+            b[row] -= f * b[col]
+    var out: f64[4] = [0.0, 0.0, 0.0, 0.0]
+    var row = n
+    while row > 0:
+        row -= 1
+        var sum = b[row]
+        for k in row + 1..<n:
+            sum -= a[row * 4 + k] * out[k]
+        out[row] = sum / a[row * 4 + row]
+    return out
+
+## How many training reflectances there are, and reflectance `at`.
+pub func training_count() -> usize:
+    return camera_data.training_count
+
+pub func training(at: usize) -> Spectrum:
+    var out: Spectrum
+    for k in 0..<samples:
+        out.values[k] = camera_data.training[at * 81 + k]
+    return out
+
+# mark: Tests =================================================================
+
+test "measured cameras are found under the names their raw files give":
+    assert(measured("SONY", "ILCE-7M3") != none)
+    assert(measured("NIKON CORPORATION", "NIKON D850") != none)
+    assert(measured("Canon", "Canon EOS R5 Mark II") != none)
+    assert(measured("Canon", "Canon EOS R5") != none)
+    assert(measured("Leica Camera AG", "LEICA M11") == none)
+
+test "a camera estimated from its matrix is close to its measured curves":
+    let found = measured("SONY", "ILCE-7M3")
+    assert(found != none)
+    let truth = found else return
+    # The matrix XYZ → camera that the training reflectances under D65 imply
+    # (least squares), as a raw converter's profile would give it.
+    let light = spectral.illuminant(6504.0)
+    var xx: f64[9]
+    var xc: f64[9]
+    for k in 0..<(usize)9:
+        xx[k] = 0.0
+        xc[k] = 0.0
+    for patch in 0..<training_count():
+        var lit = training(patch)
+        for at in 0..<samples:
+            lit.values[at] *= light.values[at]
+        let seen = lit.xyz()
+        let values = truth.of(&lit)
+        let v: f64[3] = [seen.x, seen.y, seen.z]
+        for a in 0..<(usize)3:
+            for b in 0..<(usize)3:
+                xx[a * 3 + b] += v[a] * v[b]
+                xc[a * 3 + b] += v[a] * values[b]
+    let inverse = xyz.invert(xyz.Matrix3(xx)).m
+    var m: f64[9]
+    for row in 0..<(usize)3:
+        for col in 0..<(usize)3:
+            var sum = 0.0
+            for k in 0..<(usize)3:
+                sum += inverse[col * 3 + k] * xc[k * 3 + row]
+            m[row * 3 + col] = sum
+    let kelvins: f64[1] = [6504.0]
+    let guess = estimate(m, kelvins)
+    # Each channel within 15% of the peak, root mean square.
+    for channel in 0..<(usize)3:
+        var peak = 0.0
+        var sum = 0.0
+        for at in 0..<samples:
+            peak = math.max(peak, truth.curves[channel * 81 + at])
+        for at in 0..<samples:
+            let d = guess.curves[channel * 81 + at] - truth.curves[channel * 81 + at]
+            sum += d * d
+        assert(math.sqrt(sum / (f64)samples) < 0.15 * peak)
+
+test "the observer as a camera sees XYZ":
+    let light = spectral.planck(3200.0)
+    let values = observer().of(&light)
+    assert(math.abs(values[1] - 1.0) < 1.0e-9)

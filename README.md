@@ -15,7 +15,8 @@ UI theme and a file codec agree about what a color is:
 | `hsl` | HSV (Photoshop's HSB) and HSL over encoded RGB, for pickers |
 | `space` | `ColorSpace` = name + primaries + transfer, as OpenColorIO models one; a catalogue (`space.all`, `space.named`); `convert(color, from, to)` — decode, matrix, adapt, matrix, encode — plus `to_lab`, `to_oklab_in`, `to_appearance`, `in_gamut`, `clamp` |
 | `temperature` | correlated color temperature and tint (Robertson, with the DNG SDK's tint scale): `white(kelvin, tint)` and `of(chromaticity)` |
-| `spectral` | spectra at 5 nm over 380–780 nm, the CIE 1931 observer, black-body light, and spectral upsampling (Jakob & Hanika's sigmoid spectra): `fit` one color, `Upsampler` a grid over xy |
+| `spectral` | spectra at 5 nm over 380–780 nm, the CIE 1931 observer, black-body and CIE daylight light, a white balance's light as a spectrum, and spectral upsampling (Jakob & Hanika's sigmoid spectra): `fit` one color, `Upsampler` a grid over xy |
+| `camera` | cameras' spectral sensitivities: 52 measured (rawtoaces-data), or estimated from a raw's color matrix; 190 training reflectances |
 | `aces` | the ACES 2.0 Output Transform: Hellwig 2022 JMh, the Daniele tonescale, chroma compression and gamut compression into a display's limiting gamut, for SDR and HDR peaks, and its inverse; matches OpenColorIO's builtin transforms within 1e-4 of the peak |
 | `icc` | ICC profiles, a port of skcms (Skia's ICC library): `parse` (v2 and v4, matrix/TRC, A2B/B2A lookup tables, cicp), transfer functions and curve fitting, `transform` between profiles and pixel formats; Skia's `ColorSpace` (from a profile, CICP code points or named primaries and curves) and the `Steps` between two of them |
 
@@ -130,6 +131,11 @@ any color's spectrum is its cell's times its luminance. Chromaticities beyond
 the spectral locus take the nearest color toward the white a surface can show.
 A 48 × 48 grid fits in about 0.1 s.
 
+Light: `planck(kelvin)`, `daylight(kelvin)` (CIE's D series from S0, S1, S2,
+4000–25000 K) and `illuminant(kelvin, tint)`, the light a white balance names as
+a spectrum: a black body below 4000 K, daylight above 5000 K, a blend between,
+then nudged onto the white `temperature.white(kelvin, tint)` gives exactly.
+
 ```luce
 from luce_color import spectral
 
@@ -139,6 +145,31 @@ defer grid.release()
 let skin = grid.spectrum(30, 22)     # light at that cell's chromaticity, Y = 1
 let exposure = skin.dot(response)   # through a sensor's f64[81] response
 ```
+
+## Cameras (`camera`)
+
+A camera records three numbers per pixel, each the scene's spectrum weighted by
+one of its channels' spectral sensitivities. `camera.Response` holds those
+curves; `of(spectrum)` gives the camera's values. `measured(make, model)` finds
+the 52 cameras the Academy's rawtoaces-data measured (Canon, Nikon, Sony,
+Fujifilm, Panasonic, Hasselblad and others; names compared the way raw files
+give them). For any other camera, `estimate(to_camera, kelvins)` fits curves to
+its color matrices (XYZ to raw values under each light) in a prior over the
+measured ones, each channel's mean shape and three principal components, gains
+free, after Solomatov and Akkaynak (ICCP 2023): about a tenth of the peak off
+the measured curves. `observer()` is the CIE observer as a camera, whose values
+are XYZ. `training(at)` gives the 190 reflectances rawtoaces fits its matrices to.
+
+```luce
+from luce_color import camera
+
+let sony = camera.measured("SONY", "ILCE-7M3")      # Response?
+let guess = camera.estimate(xyz_to_raw_d65, [6504.0]) # from a raw's matrix
+```
+
+The measured curves and the training reflectances are the Academy Software
+Foundation's rawtoaces-data (https://github.com/AcademySoftwareFoundation/rawtoaces-data),
+Apache License 2.0; `tools/cameras.py` generates `src/camera_data.lucb` from it.
 
 ## Theme derivations (`color`)
 

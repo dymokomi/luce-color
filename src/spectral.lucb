@@ -8,6 +8,7 @@
 from luce_std import math
 import memory
 from xyz import XYZ, Chromaticity
+import temperature
 
 # mark: Sampling ==============================================================
 
@@ -79,6 +80,92 @@ pub func planck(kelvin: f64) -> Spectrum:
     for at in 0..<samples:
         out.values[at] /= y
     return out
+
+## CIE daylight's basis S0, S1, S2 (CIE 15:2004, linearly interpolated to 5 nm),
+## one after the other.
+let daylight_basis: f64[243] = [
+    63.4, 64.6, 65.8, 80.3, 94.8, 99.8, 104.8, 105.35, 105.9, 101.35, 96.8, 105.35, 113.9, 119.75, 125.6, 125.55,
+    125.5, 123.4, 121.3, 121.3, 121.3, 117.4, 113.5, 113.3, 113.1, 111.95, 110.8, 108.65, 106.5, 107.65, 108.8,
+    107.05, 105.3, 104.85, 104.4, 102.2, 100.0, 98.0, 96.0, 95.55, 95.1, 92.1, 89.1, 89.8, 90.5, 90.4, 90.3, 89.35,
+    88.4, 86.2, 84.0, 84.55, 85.1, 83.5, 81.9, 82.25, 82.6, 83.75, 84.9, 83.1, 81.3, 76.6, 71.9, 73.1, 74.3, 75.35,
+    76.4, 69.85, 63.3, 67.5, 71.7, 74.35, 77.0, 71.1, 65.2, 56.45, 47.7, 58.15, 68.6, 66.8, 65.0, 38.5, 36.75, 35.0,
+    39.2, 43.4, 44.85, 46.3, 45.1, 43.9, 40.5, 37.1, 36.9, 36.7, 36.3, 35.9, 34.25, 32.6, 30.25, 27.9, 26.1, 24.3,
+    22.2, 20.1, 18.15, 16.2, 14.7, 13.2, 10.9, 8.6, 7.35, 6.1, 5.15, 4.2, 3.05, 1.9, 0.95, 0.0, -0.8, -1.6, -2.55,
+    -3.5, -3.5, -3.5, -4.65, -5.8, -6.5, -7.2, -7.9, -8.6, -9.05, -9.5, -10.2, -10.9, -10.8, -10.7, -11.35, -12.0,
+    -13.0, -14.0, -13.8, -13.6, -12.8, -12.0, -12.65, -13.3, -13.1, -12.9, -11.75, -10.6, -11.1, -11.6, -11.9,
+    -12.2, -11.2, -10.2, -9.0, -7.8, -9.5, -11.2, -10.8, -10.4, 3.0, 2.1, 1.2, 0.05, -1.1, -0.8, -0.5, -0.6, -0.7,
+    -0.95, -1.2, -1.9, -2.6, -2.75, -2.9, -2.85, -2.8, -2.7, -2.6, -2.6, -2.6, -2.2, -1.8, -1.65, -1.5, -1.4, -1.3,
+    -1.25, -1.2, -1.1, -1.0, -0.75, -0.5, -0.4, -0.3, -0.15, 0.0, 0.1, 0.2, 0.35, 0.5, 1.3, 2.1, 2.65, 3.2, 3.65,
+    4.1, 4.4, 4.7, 4.9, 5.1, 5.9, 6.7, 7.0, 7.3, 7.95, 8.6, 9.2, 9.8, 10.0, 10.2, 9.25, 8.3, 8.95, 9.6, 9.05, 8.5,
+    7.75, 7.0, 7.3, 7.6, 7.8, 8.0, 7.35, 6.7, 5.95, 5.2, 6.3, 7.4, 7.1, 6.8]
+
+## CIE daylight of correlated color temperature `kelvin` (clamped to
+## 4000–25000 K), scaled to Y = 1: the chromaticity CIE 15 gives the D series,
+## then its spectrum from S0, S1 and S2.
+pub func daylight(kelvin: f64) -> Spectrum:
+    let t = math.clamp(kelvin, 4000.0, 25000.0)
+    let x = (-4.6070e9 / (t * t * t) + 2.9678e6 / (t * t) + 0.09911e3 / t + 0.244063) if t <= 7000.0 else (-2.0064e9 / (t * t * t) + 1.9018e6 / (t * t) + 0.24748e3 / t + 0.237040)
+    let y = -3.0 * x * x + 2.87 * x - 0.275
+    let m = 0.0241 + 0.2562 * x - 0.7341 * y
+    let m1 = (-1.3515 - 1.7703 * x + 5.9114 * y) / m
+    let m2 = (0.0300 - 31.4424 * x + 30.0717 * y) / m
+    var out: Spectrum
+    for at in 0..<samples:
+        out.values[at] = daylight_basis[at] + m1 * daylight_basis[81 + at] + m2 * daylight_basis[162 + at]
+    let total = out.xyz().y
+    for at in 0..<samples:
+        out.values[at] /= total
+    return out
+
+## The light a photo's white balance names: `kelvin` and `tint` as temperature.lucb
+## means them (the white a raw converter balances for), as a spectrum, Y = 1. Its
+## shape is a black body's below 4000 K and CIE daylight's above 5000 K, between
+## them a blend; a green bump (or dip) and a nudge of the temperature then put it
+## on the named white exactly, so the white balance and the spectrum agree.
+pub func illuminant(kelvin: f64, tint: f64 = 0.0) -> Spectrum:
+    let goal = temperature.white(kelvin, tint)
+    var k = math.clamp(kelvin, 1667.0, 25000.0)
+    var green = 0.0
+    for _ in 0..<12:
+        let here = chromaticity_of(shaped(k, green))
+        let dx = here.x - goal.x
+        let dy = here.y - goal.y
+        if math.abs(dx) + math.abs(dy) < 1.0e-6:
+            break
+        let by_k = chromaticity_of(shaped(k * 1.01, green))
+        let by_green = chromaticity_of(shaped(k, green + 0.01))
+        let a = (by_k.x - here.x) / (k * 0.01)
+        let b = (by_green.x - here.x) / 0.01
+        let c = (by_k.y - here.y) / (k * 0.01)
+        let d = (by_green.y - here.y) / 0.01
+        let det = a * d - b * c
+        if math.abs(det) < 1.0e-18:
+            break
+        k = math.clamp(k - (d * dx - b * dy) / det, 1000.0, 40000.0)
+        green = math.clamp(green - (a * dy - c * dx) / det, -0.9, 3.0)
+    return shaped(k, green)
+
+## A light's shape at `kelvin` (see `illuminant`) with a green bump of `green` (a
+## Gaussian at 545 nm, 45 nm wide; negative takes green away), Y = 1.
+func shaped(kelvin: f64, green: f64) -> Spectrum:
+    var out = planck(kelvin)
+    if kelvin > 4000.0:
+        let t = math.clamp((kelvin - 4000.0) / 1000.0, 0.0, 1.0)
+        let day = daylight(kelvin)
+        for at in 0..<samples:
+            out.values[at] = out.values[at] * (1.0 - t) + day.values[at] * t
+    for at in 0..<samples:
+        let d = (wavelength(at) - 545.0) / 45.0
+        out.values[at] *= 1.0 + green * math.exp(-d * d)
+    let total = out.xyz().y
+    for at in 0..<samples:
+        out.values[at] /= total
+    return out
+
+func chromaticity_of(light: Spectrum) -> Chromaticity:
+    let value = light.xyz()
+    let sum = value.x + value.y + value.z
+    return Chromaticity(value.x / sum, value.y / sum)
 
 # mark: Sigmoid spectra =======================================================
 
@@ -342,3 +429,12 @@ test "every upsampler cell has Y = 1 and the white cell is near flat":
     for i in 0..<(usize)16:
         for j in 0..<(usize)16:
             assert(math.abs(grid.spectrum(i, j).xyz().y - 1.0) < 1.0e-6)
+
+test "CIE daylight at 6504 K is D65, and a named light lands on its white":
+    let d65 = daylight(6504.0)
+    let c = chromaticity_of(d65)
+    assert(math.abs(c.x - 0.3127) < 0.0005 and math.abs(c.y - 0.3290) < 0.0005)
+    for (kelvin, tint) in [(2856.0, 0.0), (3200.0, 10.0), (4500.0, -15.0), (5500.0, 0.0), (7500.0, 20.0)]:
+        let goal = temperature.white(kelvin, tint)
+        let here = chromaticity_of(illuminant(kelvin, tint))
+        assert(math.abs(here.x - goal.x) < 1.0e-4 and math.abs(here.y - goal.y) < 1.0e-4)
