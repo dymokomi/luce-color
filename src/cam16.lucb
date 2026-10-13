@@ -141,10 +141,14 @@ func inverse_response(adapted: f64, fl: f64) -> f64:
 ## The XYZ (Y = 100 scale) that looks under `target` as `xyz` looks under `source`:
 ## the same lightness, chroma and hue, each relative to its own white (the
 ## usual aim when an image moves between media, as a print projected in a dark
-## cinema shown on a display in a dim room).
-pub func corresponding(xyz: XYZ, source: Viewing, target: Viewing) -> XYZ:
+## cinema shown on a display in a dim room). With `colorfulness`, the same
+## colorfulness M instead of chroma: colors look more colorful the brighter
+## they are lit (the Hunt effect), so a scene seen dimmer comes out less
+## saturated, one seen brighter more.
+pub func corresponding(xyz: XYZ, source: Viewing, target: Viewing, colorfulness: bool = false) -> XYZ:
     let app = appearance(xyz, source)
-    return from_jch(app.j, app.c, app.h, target)
+    let c = app.m / math.pow(target.fl, 0.25) if colorfulness else app.c
+    return from_jch(app.j, c, app.h, target)
 
 # mark: UCS ===================================================================
 
@@ -212,3 +216,13 @@ test "a cinema's image is made flatter for a dim room, a room-lit print more con
     assert(near(corresponding(XYZ(95.047 * 0.01, 1.0, 108.883 * 0.01), cinema, display).y, 1.648, 0.01))
     assert(near(corresponding(XYZ(95.047 * 0.18, 18.0, 108.883 * 0.18), room, display).y, 13.501, 0.02))
     assert(near(corresponding(XYZ(0.0, 0.0, 0.0), cinema, display).y, 0.0, 0.01))
+
+test "matched in colorfulness, a color seen dimmer comes out less saturated (Hunt)":
+    let white = XYZ(95.047, 100.0, 108.883)
+    let dim = viewing(white, 9.6, 20.0, 0.0)
+    let display = viewing(white, 20.0, 20.0, 1.0)
+    let red = XYZ(41.24, 21.26, 1.93)
+    let by_chroma = appearance(corresponding(red, dim, display), display)
+    let by_colorfulness = appearance(corresponding(red, dim, display, colorfulness = true), display)
+    assert(by_colorfulness.c < by_chroma.c * 0.97)
+    assert(near(by_colorfulness.j, by_chroma.j, 0.01) and near(by_colorfulness.h, by_chroma.h, 0.01))
